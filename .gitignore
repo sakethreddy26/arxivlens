@@ -20,7 +20,13 @@ __pycache__/
 mlruns/
 
 # Internal planning docs — kept locally, not published
+BUILD_PLAN.md
 PROGRESS.md
+
+# Tooling / assistant config — local only
+.claude/
+CLAUDE.md
+**/CLAUDE.md
 
 # Editors / OS
 .vscode/
