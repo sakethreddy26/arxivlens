@@ -289,7 +289,3 @@ ArXivLens/
 - The Docker image uses CPU-only PyTorch. Serving latency at scale requires a GPU host; the cross-encoder scores each candidate with a separate forward pass (O(K) per query).
 
 ---
-
-## License / Author
-
-MIT · Saketh Pate
