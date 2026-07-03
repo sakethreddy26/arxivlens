@@ -350,6 +350,12 @@ class TransformerEncoder(nn.Module):
         query is forbidden from attending to padded KEY positions. (Padded
         queries still produce rows, but nothing downstream reads them once
         pooling respects the same mask.)
+
+        Downstream contract: :meth:`CrossEncoderReranker.forward` pools ONLY
+        position 0 ([CLS], never padded because sequences are right-padded), so
+        the padded query rows this mask leaves un-suppressed are never read.
+        Any pooling change that reads other positions must mask those rows —
+        see the MASKING INVARIANT note in CrossEncoderReranker.forward.
         """
         return attention_mask.bool()[:, None, None, :]  # (batch, 1, 1, seq_len)
 

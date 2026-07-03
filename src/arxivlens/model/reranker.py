@@ -110,6 +110,13 @@ class CrossEncoderReranker(nn.Module):
             input_ids, attention_mask=attention_mask, return_attention=False
         )
         cls_hidden = hidden_states[:, 0]  # (batch, d_model) — the [CLS] slot
+        # MASKING INVARIANT: hidden_states rows for padded KEY positions are
+        # still computed (the encoder produces a value for every position), but
+        # they are harmless HERE only because pooling reads position 0 — the
+        # [CLS] token, which is right-padded so it is never itself a pad. If this
+        # pooling is ever changed to mean-pooling (or anything that reads padded
+        # positions), those padded rows MUST be masked out first or they will
+        # contaminate the logit. See TransformerEncoder._expand_padding_mask.
         logits = self.scorer(cls_hidden).squeeze(-1)  # (batch,)
         return logits
 
