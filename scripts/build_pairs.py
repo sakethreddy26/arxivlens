@@ -289,6 +289,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the last VAL_FRACTION as the validation split. Using a fresh
         # random.Random(seed) keeps the split reproducible and independent of
         # however many draws the generation RNG consumed.
+        #
+        # NOTE: the shuffle operates on individual pairs, so a single query_id's
+        # candidates may end up split across the train/val files. That is
+        # acceptable — _run_eval groups by query_id across the whole val loader
+        # and handles a variable number of candidates per query.
         pair_dicts = [pair.as_dict() for pair in generated]
         random.Random(args.seed).shuffle(pair_dicts)
 

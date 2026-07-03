@@ -190,19 +190,19 @@ def _run_eval(
 ) -> dict[str, float]:
     """Run the held-out val set through the model and return ranking metrics.
 
-    Each batch item is treated as an independent single-candidate query.  Because
-    ``pairs.jsonl`` records are independent (query, passage, label) triples with
-    no shared query_id grouping, the 1-candidate-per-query interpretation is the
-    correct one for training-time monitoring: we just want to know whether the
-    model's BCE logits correlate with ground-truth labels.
-
-    In a real retrieval eval the caller would group ``k`` candidates per query_id
-    and feed all ``k`` at once; that is not done here because the training pairs
-    file does not carry query_ids.
+    Candidates are grouped by ``query_id`` across the WHOLE val loader: every
+    (query, passage) pair carrying the same ``query_id`` is one candidate of a
+    single ranking, so ``evaluate_rankings`` sees a genuine multi-candidate
+    ranking per query rather than a degenerate 1-candidate-per-query view. This
+    survives a shuffled val loader because grouping is by key, not by batch, and
+    handles a variable number of candidates per query (a query_id's candidates
+    may even be split across train/val by the pair-level shuffle in
+    ``build_pairs.py``).
 
     Args:
         model: the reranker (may be DDP-wrapped; forward still works).
-        val_loader: dataloader over the held-out pairs.
+        val_loader: dataloader over the held-out pairs; batches carry
+            ``query_ids`` (a list[str]) from ``collate_fn``.
         accelerator: used only to move tensors; eval always runs on main process.
 
     Returns:
@@ -210,7 +210,8 @@ def _run_eval(
         ``ndcg@5``, ``ndcg@10``, ``mrr``, ``recall@1``, ``recall@5``, ``recall@10``.
     """
     model.eval()
-    all_queries: list[tuple[list[float], list[float]]] = []
+    # query_id -> (scores, labels) accumulated across every batch.
+    groups: dict[str, tuple[list[float], list[float]]] = {}
 
     try:
         with torch.no_grad():
@@ -218,13 +219,16 @@ def _run_eval(
                 logits = model(batch["input_ids"], batch["attention_mask"])  # (B,)
                 scores = logits.cpu().float().tolist()
                 labels = batch["labels"].cpu().float().tolist()
-                # Each element is one candidate; wrap as a 1-candidate query so
-                # evaluate_rankings can compute its standard metrics.
-                for s, l in zip(scores, labels):
-                    all_queries.append(([s], [l]))
+                query_ids = batch["query_ids"]
+                for qid, s, l in zip(query_ids, scores, labels):
+                    bucket = groups.setdefault(qid, ([], []))
+                    bucket[0].append(s)
+                    bucket[1].append(l)
     finally:
         model.train()
 
+    # Skip empty groups (evaluate_rankings also skips empties, but be explicit).
+    all_queries = [(s, l) for s, l in groups.values() if s]
     return evaluate_rankings(all_queries)
 
 

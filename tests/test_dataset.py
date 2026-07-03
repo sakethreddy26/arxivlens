@@ -111,11 +111,11 @@ def tokenizer() -> StubTokenizer:
 def pairs_file(tmp_path: Path) -> Path:
     """A temporary pairs.jsonl file with 5 examples (3 positive, 2 negative)."""
     records = [
-        {"query": "attention is all you need", "passage": "transformer architecture", "label": 1},
-        {"query": "bert language model",        "passage": "bidirectional encoder",   "label": 1},
-        {"query": "neural network depth",       "passage": "deep learning residuals", "label": 0},
-        {"query": "graph neural networks",      "passage": "node embeddings pooling", "label": 0},
-        {"query": "contrastive self supervised", "passage": "SimCLR representation",  "label": 1},
+        {"query_id": "q0", "query": "attention is all you need", "passage": "transformer architecture", "label": 1},
+        {"query_id": "q0", "query": "bert language model",        "passage": "bidirectional encoder",   "label": 1},
+        {"query_id": "q1", "query": "neural network depth",       "passage": "deep learning residuals", "label": 0},
+        {"query_id": "q2", "query": "graph neural networks",      "passage": "node embeddings pooling", "label": 0},
+        {"query_id": "q0", "query": "contrastive self supervised", "passage": "SimCLR representation",  "label": 1},
     ]
     path = tmp_path / "pairs.jsonl"
     with path.open("w", encoding="utf-8") as fh:
@@ -144,9 +144,35 @@ def test_dataset_len(dataset: PairDataset) -> None:
 # --------------------------------------------------------------------------- #
 
 def test_getitem_keys(dataset: PairDataset) -> None:
-    """__getitem__ returns a dict with the three expected keys."""
+    """__getitem__ returns a dict with the expected keys (incl. query_id)."""
     item = dataset[0]
-    assert set(item.keys()) == {"input_ids", "attention_mask", "label"}
+    assert set(item.keys()) == {"input_ids", "attention_mask", "label", "query_id"}
+
+
+def test_collate_carries_query_ids(dataset: PairDataset) -> None:
+    """collate_fn returns a length-B list of str query_ids (not a tensor)."""
+    items = [dataset[i] for i in range(3)]
+    batch = collate_fn(items)
+    assert isinstance(batch["query_ids"], list)
+    assert len(batch["query_ids"]) == 3
+    assert all(isinstance(q, str) for q in batch["query_ids"])
+    # Fixture records 0..2 carry query_ids q0, q0, q1.
+    assert batch["query_ids"] == ["q0", "q0", "q1"]
+
+
+def test_getitem_query_id_defaults_when_absent(
+    tmp_path: Path, tokenizer: StubTokenizer
+) -> None:
+    """A record without a query_id field falls back to str(idx)."""
+    path = tmp_path / "no_qid.jsonl"
+    path.write_text(
+        json.dumps({"query": "a b", "passage": "c d", "label": 1}) + "\n"
+        + json.dumps({"query": "e f", "passage": "g h", "label": 0}) + "\n",
+        encoding="utf-8",
+    )
+    ds = PairDataset(path, tokenizer, max_length=64)
+    assert ds[0]["query_id"] == "0"
+    assert ds[1]["query_id"] == "1"
 
 
 def test_word_id_is_process_stable() -> None:

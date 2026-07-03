@@ -55,8 +55,9 @@ def test_positive_per_record_label_1():
     positives = [p for p in pairs if p.label == 1]
     assert len(positives) == len(RECORDS)
     for i, rec in enumerate(RECORDS):
-        # Positive uses the record's own title as query and own abstract.
-        assert Pair(rec["title"], rec["abstract"], 1) in positives
+        # Positive uses the record's own title as query and own abstract; the
+        # query_id is the record's own id.
+        assert Pair(rec["id"], rec["title"], rec["abstract"], 1) in positives
 
 
 def test_counts_match_ratio():
@@ -166,6 +167,20 @@ def test_different_seed_differs_large_pool():
     pos_a = [p for p in a if p.label == 1]
     pos_b = [p for p in b if p.label == 1]
     assert pos_a == pos_b
+
+
+def test_query_id_shared_per_source():
+    """All candidates synthesized from one source record share one query_id."""
+    pairs = build(n_hard=2, n_easy=2)
+    # Group by the record's own id and check every pair from that source query
+    # (positive + hard + easy negatives) carries the same query_id.
+    for idx, rec in enumerate(RECORDS):
+        query = rec["title"]
+        group = [p for p in pairs if p.query == query]
+        assert group, f"no pairs generated for source {idx}"
+        assert all(p.query_id == rec["id"] for p in group)
+    # query_id is a string.
+    assert all(isinstance(p.query_id, str) for p in pairs)
 
 
 def test_hard_negatives_do_not_collide_with_easy():

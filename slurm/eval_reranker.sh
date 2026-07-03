@@ -241,23 +241,28 @@ print(f"[eval] Val dataset size: {len(dataset)} pairs")
 # batch_size=64 is safe on a single 80 GB A100 for max_len=256 sequences.
 loader = DataLoader(dataset, batch_size=64, collate_fn=collate_fn, shuffle=False)
 
-# Score every (query, passage) pair.  Each pair is treated as a 1-candidate
-# query — consistent with how _run_eval works in train_reranker.py.
-# The all_queries list is fed directly to evaluate_rankings for macro-averaged
-# nDCG, MRR, and Recall metrics.
-all_queries = []
+# Score every (query, passage) pair and GROUP by query_id across the whole
+# loader — mirroring _run_eval in train_reranker.py — so each query becomes a
+# genuine multi-candidate ranking rather than a degenerate 1-candidate query.
+# The grouped (scores, labels) tuples are fed to evaluate_rankings for
+# macro-averaged nDCG, MRR, and Recall metrics.
+groups = {}
 with torch.no_grad():
     for batch_idx, batch in enumerate(loader):
         ids  = batch["input_ids"].to(device)
         mask = batch["attention_mask"].to(device)
         # model returns (B,) raw logits; convert to float32 on CPU for metrics.
         logits = model(ids, mask).cpu().float()
-        for s, l in zip(logits.tolist(), batch["labels"].tolist()):
-            all_queries.append(([s], [l]))
+        for qid, s, l in zip(batch["query_ids"], logits.tolist(), batch["labels"].tolist()):
+            bucket = groups.setdefault(qid, ([], []))
+            bucket[0].append(s)
+            bucket[1].append(l)
 
         if (batch_idx + 1) % 20 == 0:
             print(f"[eval] Scored {(batch_idx + 1) * 64} / {len(dataset)} pairs ...")
 
+# Skip empty groups; feed one (scores, labels) tuple per query_id.
+all_queries = [(s, l) for s, l in groups.values() if s]
 metrics = evaluate_rankings(all_queries)
 
 print()

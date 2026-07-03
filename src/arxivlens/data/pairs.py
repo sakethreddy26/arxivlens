@@ -55,15 +55,27 @@ NeighborFn = Callable[[int, int], Sequence[int]]
 
 @dataclass(frozen=True)
 class Pair:
-    """One training example: a query, a candidate passage, and a 0/1 label."""
+    """One training example: a query, a candidate passage, and a 0/1 label.
 
+    ``query_id`` ties together all candidates synthesized from the SAME source
+    record (the positive and its hard/easy negatives share one id), so eval can
+    group them into a single ranking instead of treating each pair as its own
+    1-candidate query.
+    """
+
+    query_id: str
     query: str
     passage: str
     label: int
 
     def as_dict(self) -> dict[str, object]:
-        """Serialize to the ``{query, passage, label}`` JSONL schema."""
-        return {"query": self.query, "passage": self.passage, "label": self.label}
+        """Serialize to the ``{query_id, query, passage, label}`` JSONL schema."""
+        return {
+            "query_id": self.query_id,
+            "query": self.query,
+            "passage": self.passage,
+            "label": self.label,
+        }
 
 
 def _text(record: Record, key: str) -> str:
@@ -127,9 +139,13 @@ def build_pairs(
     for idx, record in enumerate(records):
         query = _text(record, title_key)
         positive_passage = _text(record, abstract_key)
+        # All candidates synthesized from this source record share one query_id
+        # so eval can group them into a single ranking. Prefer the record's own
+        # id; fall back to its positional index as a stable string.
+        query_id = _text(record, "id") or str(idx)
 
         # 1) Positive: this paper's title -> its own abstract.
-        yield Pair(query=query, passage=positive_passage, label=1)
+        yield Pair(query_id=query_id, query=query, passage=positive_passage, label=1)
 
         used: set[int] = {idx}  # never reuse the source paper as a negative
 
@@ -153,6 +169,7 @@ def build_pairs(
                     continue
                 used.add(cand_idx)
                 yield Pair(
+                    query_id=query_id,
                     query=query,
                     passage=_text(records[cand_idx], abstract_key),
                     label=0,
@@ -166,6 +183,7 @@ def build_pairs(
             for cand_idx in pool[:n_easy]:
                 used.add(cand_idx)
                 yield Pair(
+                    query_id=query_id,
                     query=query,
                     passage=_text(records[cand_idx], abstract_key),
                     label=0,

@@ -73,6 +73,8 @@ class PairDataset(Dataset):
             "input_ids":      LongTensor of shape (seq_len,),
             "attention_mask": LongTensor of shape (seq_len,),
             "label":          FloatTensor scalar (0.0 or 1.0),
+            "query_id":       str (groups candidates for eval; falls back to the
+                              positional index when the record lacks the key),
         }
 
     Tokenization is **lazy** — it happens at ``__getitem__`` time, not at
@@ -105,7 +107,7 @@ class PairDataset(Dataset):
         """Number of (query, passage, label) examples in the file."""
         return len(self._lines)
 
-    def __getitem__(self, idx: int) -> dict[str, Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         """Tokenize the pair at ``idx`` and return tensors.
 
         Args:
@@ -117,11 +119,16 @@ class PairDataset(Dataset):
             * ``"input_ids"`` — ``LongTensor`` of shape ``(seq_len,)``.
             * ``"attention_mask"`` — ``LongTensor`` of shape ``(seq_len,)``.
             * ``"label"`` — ``FloatTensor`` scalar (0.0 or 1.0).
+            * ``"query_id"`` — ``str`` grouping key (defaults to ``str(idx)``
+              when the record has no ``query_id`` field).
         """
         record: dict[str, Any] = json.loads(self._lines[idx])
         query: str = record["query"]
         passage: str = record["passage"]
         label: int = int(record["label"])
+        # query_id groups candidates for a single ranking during eval. Older
+        # pairs files predate this field, so fall back to the positional index.
+        query_id: str = str(record.get("query_id", idx))
 
         # The tokenizer is called with the query and passage as a pair so it
         # can lay out [CLS] query [SEP] passage [SEP] and handle truncation.
@@ -143,10 +150,11 @@ class PairDataset(Dataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "label": label_tensor,
+            "query_id": query_id,
         }
 
 
-def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
+def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Collate a list of ``PairDataset`` items into padded batch tensors.
 
     Sequences within a batch are padded on the **right** with zeros to match
@@ -155,7 +163,8 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 
     Args:
         batch: List of dicts, each with ``"input_ids"``, ``"attention_mask"``,
-            and ``"label"`` as returned by :meth:`PairDataset.__getitem__`.
+            ``"label"``, and ``"query_id"`` as returned by
+            :meth:`PairDataset.__getitem__`.
 
     Returns:
         Dict with keys:
@@ -166,6 +175,9 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
           Note the plural key name: the trainer reads ``batch["labels"]``
           to match HuggingFace Trainer conventions and avoid shadowing the
           singular ``"label"`` key returned per item.
+        * ``"query_ids"``      — ``list[str]`` of length ``B`` (NOT a tensor).
+          The eval loop groups scores/labels by this key so all candidates of
+          one query form a single ranking.
     """
     max_len: int = max(item["input_ids"].size(0) for item in batch)
     batch_size: int = len(batch)
@@ -179,9 +191,11 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         padded_mask[i, :seq_len] = item["attention_mask"]
 
     labels: Tensor = torch.stack([item["label"] for item in batch])  # (B,)
+    query_ids: list[str] = [item["query_id"] for item in batch]
 
     return {
         "input_ids": padded_ids,
         "attention_mask": padded_mask,
         "labels": labels,
+        "query_ids": query_ids,
     }
