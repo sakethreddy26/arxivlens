@@ -370,6 +370,8 @@ def run_training(
     val_fraction: float = float(cfg.training.val_fraction)
     seed: int = int(cfg.training.seed)
     max_input_length: int = int(cfg.model.max_input_length)
+    # Gradient clipping: getattr fallback keeps old configs working (default 1.0).
+    grad_clip: float = float(getattr(cfg.training, "grad_clip", 1.0))
 
     # ------------------------------------------------------------------
     # 2. Reproducibility seeds
@@ -592,6 +594,11 @@ def run_training(
                 # Backward through accelerator so mixed-precision scaling is
                 # handled correctly for both bf16 and fp32 modes.
                 accelerator.backward(loss)
+                # Clip gradients before the optimizer step to prevent occasional
+                # loss spikes from destabilizing training. Guarded so grad_clip
+                # <= 0 disables clipping entirely.
+                if grad_clip and grad_clip > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                 optimizer.step()
                 scheduler.step()
                 global_step += 1

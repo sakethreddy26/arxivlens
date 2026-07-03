@@ -17,6 +17,7 @@ training:
   batch_size: 32                            # examples per gradient step; tune down if GPU OOM
   n_epochs: 5                              # full passes over the training pairs file
   warmup_steps: 200                         # linear LR warmup from 0 -> learning_rate over this many steps
+  grad_clip: 1.0                            # max global grad norm before optimizer.step (<=0 disables)
   checkpoint_every_steps: 500              # save a .pt snapshot every N optimizer steps
   eval_every_steps: 500                    # run held-out eval and log val/ metrics every N steps
   val_fraction: 0.1                        # fraction of pairs to hold out if no val_pairs_file given
