@@ -37,3 +37,6 @@ jobs:
 
       - name: Test
         run: pytest
+
+      - name: Smoke test (CPU end-to-end train + resume + eval)
+        run: python scripts/smoke_test.py
