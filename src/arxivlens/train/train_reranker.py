@@ -649,20 +649,32 @@ def run_training(
                     )
 
                 # --- Periodic held-out eval ---
-                if global_step % eval_every == 0 and val_loader is not None:
+                # Eval runs on the MAIN process only: the val set is small, so
+                # gathering across ranks (accelerator.gather) buys nothing and
+                # would just add sync overhead. Non-main ranks skip eval and then
+                # rejoin at wait_for_everyone() below, so no rank races ahead into
+                # the next checkpoint write while main is still evaluating.
+                if (
+                    global_step % eval_every == 0
+                    and val_loader is not None
+                    and accelerator.is_main_process
+                ):
                     metrics = _run_eval(model, val_loader, accelerator)
-                    if accelerator.is_main_process:
-                        mlflow.log_metrics(
-                            {f"val/{k}": v for k, v in metrics.items()},
-                            step=global_step,
-                        )
-                        # Print a quick summary so Sol logs show progress.
-                        ndcg10 = metrics.get("ndcg@10", float("nan"))
-                        mrr_val = metrics.get("mrr", float("nan"))
-                        accelerator.print(
-                            f"[eval] step={global_step} "
-                            f"ndcg@10={ndcg10:.4f} mrr={mrr_val:.4f}"
-                        )
+                    mlflow.log_metrics(
+                        {f"val/{k}": v for k, v in metrics.items()},
+                        step=global_step,
+                    )
+                    # Print a quick summary so Sol logs show progress.
+                    ndcg10 = metrics.get("ndcg@10", float("nan"))
+                    mrr_val = metrics.get("mrr", float("nan"))
+                    accelerator.print(
+                        f"[eval] step={global_step} "
+                        f"ndcg@10={ndcg10:.4f} mrr={mrr_val:.4f}"
+                    )
+                if global_step % eval_every == 0 and val_loader is not None:
+                    # Barrier so non-main ranks wait for main's eval to finish
+                    # before anyone proceeds to the next checkpoint write.
+                    accelerator.wait_for_everyone()
 
             # After the first (possibly partial) epoch, resume skipping is done.
             resume_batch = 0
@@ -696,18 +708,22 @@ def run_training(
 
         accelerator.print("[done] training complete.")
 
-        # Final eval over the full val set.
-        if val_loader is not None:
+        # Final eval over the full val set — main process only (see the
+        # periodic-eval rationale above; the val set is small).
+        if val_loader is not None and accelerator.is_main_process:
             final_metrics = _run_eval(model, val_loader, accelerator)
-            if accelerator.is_main_process:
-                mlflow.log_metrics(
-                    {f"val/final_{k}": v for k, v in final_metrics.items()},
-                    step=global_step,
-                )
-                accelerator.print(
-                    "[final eval] "
-                    + "  ".join(f"{k}={v:.4f}" for k, v in final_metrics.items())
-                )
+            mlflow.log_metrics(
+                {f"val/final_{k}": v for k, v in final_metrics.items()},
+                step=global_step,
+            )
+            accelerator.print(
+                "[final eval] "
+                + "  ".join(f"{k}={v:.4f}" for k, v in final_metrics.items())
+            )
+        if val_loader is not None:
+            # Barrier so non-main ranks don't exit the MLflow run context (and
+            # the function) before main finishes the final eval + logging.
+            accelerator.wait_for_everyone()
 
     return {
         "step_losses": step_losses,
