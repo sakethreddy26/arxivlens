@@ -111,6 +111,18 @@ class _Namespace:
                 out[key] = value
         return out
 
+    def as_dict_nested(self) -> dict[str, Any]:
+        """Reconstruct the original NESTED dict (mirrors the raw YAML layout).
+
+        Used as the checkpoint ``config`` when a caller (e.g. the smoke test)
+        does not supply the raw ``cfg_dict``. Nested because eval_reranker.sh
+        reads ``state["config"]["model"]["vocab_size"]`` etc.
+        """
+        out: dict[str, Any] = {}
+        for key, value in self.__dict__.items():
+            out[key] = value.as_dict_nested() if isinstance(value, _Namespace) else value
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Checkpoint I/O
@@ -125,6 +137,7 @@ def _save_checkpoint(
     step: int,
     checkpoint_dir: str | Path,
     cfg_dict: dict[str, Any],
+    batch_in_epoch: int = 0,
 ) -> None:
     """Serialize training state to ``checkpoint_dir/checkpoint_epoch{e}_step{s}.pt``.
 
@@ -138,10 +151,14 @@ def _save_checkpoint(
         model: the (potentially DDP-wrapped) reranker.
         optimizer: AdamW, mid-training state.
         scheduler: LambdaLR warmup scheduler.
-        epoch: current epoch index (0-based).
+        epoch: epoch currently IN PROGRESS (0-based; NOT epoch+1). Resume
+            re-enters this epoch and skips ahead to ``batch_in_epoch``.
         step: global optimizer step count.
         checkpoint_dir: directory to write into; created if absent.
         cfg_dict: raw YAML config dict for provenance.
+        batch_in_epoch: index of the NEXT unseen batch within ``epoch`` (i.e.
+            ``batch_idx + 1`` at step-checkpoint time; ``0`` at end of epoch).
+            Resume skips batches with ``batch_idx < batch_in_epoch``.
     """
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -158,6 +175,7 @@ def _save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict(),
         "epoch": epoch,
         "global_step": step,
+        "batch_in_epoch": batch_in_epoch,  # next unseen batch within `epoch`
         "config": cfg_dict,  # raw YAML dict for reproducibility
     }
 
@@ -305,27 +323,38 @@ def _build_parser() -> argparse.ArgumentParser:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    """Parse args, build everything, run the training loop."""
-    args = _build_parser().parse_args()
+def run_training(
+    cfg: _Namespace,
+    tokenizer: Any,
+    accelerator: Accelerator | None = None,
+    resume: bool = False,
+    cfg_dict: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build model/data/optimizer from ``cfg`` and run the full training loop.
 
-    # ------------------------------------------------------------------
-    # 1. Load and merge config
-    # ------------------------------------------------------------------
-    cfg_dict = _load_yaml(args.config)
-    cfg = _Namespace(cfg_dict)
+    Extracted from :func:`main` so callers (notably the CPU smoke test) can drive
+    the REAL training loop with an injected offline tokenizer — no HuggingFace
+    download, no CLI. ``main`` is a thin wrapper that parses args, builds the
+    accelerator + tokenizer, and delegates here.
 
-    # CLI flags override the YAML where provided.
-    if args.pairs is not None:
-        cfg.training.pairs_file = str(args.pairs)
-    if args.val_pairs is not None:
-        cfg.training.val_pairs_file = str(args.val_pairs)
-    if args.checkpoint_dir is not None:
-        cfg.training.checkpoint_dir = str(args.checkpoint_dir)
-    if args.mlflow_dir is not None:
-        cfg.training.mlflow_dir = str(args.mlflow_dir)
-    if args.epochs is not None:
-        cfg.training.n_epochs = args.epochs
+    Args:
+        cfg: parsed ``_Namespace`` config (already merged with CLI overrides).
+        tokenizer: any object satisfying the ``TokenizerLike`` protocol.
+        accelerator: an ``Accelerator``; created here (bf16 with fp32 fallback)
+            when ``None``.
+        resume: when True, load the latest checkpoint in ``checkpoint_dir`` and
+            continue from the exact saved epoch / batch_in_epoch / global_step.
+        cfg_dict: raw YAML dict stored inside checkpoints for provenance;
+            defaults to ``cfg.as_dict()`` when omitted.
+
+    Returns:
+        A small log dict with keys ``step_losses`` (list[float], per optimizer
+        step), ``trained_batch_indices`` (dict[int, list[int]]: epoch ->
+        batch_idx values actually trained), ``global_step`` (final step count),
+        and ``final_metrics`` (the last eval metrics dict, or ``None``).
+    """
+    if cfg_dict is None:
+        cfg_dict = cfg.as_dict_nested()
 
     # Convenient local aliases to keep loop code readable.
     pairs_file: str = cfg.training.pairs_file
@@ -340,7 +369,6 @@ def main() -> None:
     eval_every: int = int(cfg.training.eval_every_steps)
     val_fraction: float = float(cfg.training.val_fraction)
     seed: int = int(cfg.training.seed)
-    tokenizer_name: str = cfg.training.tokenizer_name
     max_input_length: int = int(cfg.model.max_input_length)
 
     # ------------------------------------------------------------------
@@ -358,27 +386,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3. Accelerator — bf16 on A100, silent fallback to fp32 elsewhere
     # ------------------------------------------------------------------
-    try:
-        accelerator = Accelerator(mixed_precision="bf16")
-    except (ValueError, RuntimeError):
-        # bf16 is not supported on all hardware (e.g., CPU-only or older GPUs).
-        # Fall back to fp32 so the script also runs in test/local environments.
-        accelerator = Accelerator(mixed_precision="no")
+    if accelerator is None:
+        try:
+            accelerator = Accelerator(mixed_precision="bf16")
+        except (ValueError, RuntimeError):
+            # bf16 is not supported on all hardware (e.g., CPU-only or older GPUs).
+            # Fall back to fp32 so the script also runs in test/local environments.
+            accelerator = Accelerator(mixed_precision="no")
 
     accelerator.print(
         f"[accelerate] device={accelerator.device}, "
         f"mixed_precision={accelerator.mixed_precision}, "
         f"num_processes={accelerator.num_processes}"
     )
-
-    # ------------------------------------------------------------------
-    # 4. Tokenizer
-    # ------------------------------------------------------------------
-    # AutoTokenizer.from_pretrained fetches bert-base-uncased from the HuggingFace
-    # hub (or HF_HOME cache on Sol). The tokenizer is injected into the model so
-    # the reranker never imports transformers directly — it only needs the protocol.
-    accelerator.print(f"[tokenizer] loading {tokenizer_name} ...")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     # ------------------------------------------------------------------
     # 5. Model
@@ -426,10 +446,19 @@ def main() -> None:
             full_dataset, [n_train, n_val], generator=generator
         )
 
+    # A dedicated generator drives the train shuffle so we can reseed it
+    # deterministically at the top of each epoch (manual_seed(seed + epoch)).
+    # That reproducible per-epoch order is what makes mid-epoch resume correct:
+    # the resumed run replays the SAME shuffled order and skips already-seen
+    # batches. This generator is SEPARATE from the random_split generator above,
+    # which stays seeded by `seed` alone so the val split is reproducible (the
+    # eval_reranker.sh mirror depends on that).
+    train_gen = torch.Generator()
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,           # shuffle every epoch for better gradient diversity
+        generator=train_gen,    # reseeded per epoch -> reproducible resume
         collate_fn=collate_fn,
         drop_last=False,        # keep partial last batch; BCE handles any size
     )
@@ -479,8 +508,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     start_epoch = 0
     global_step = 0
+    resume_batch = 0
 
-    if args.resume:
+    if resume:
         latest = _load_latest_checkpoint(checkpoint_dir)
         if latest is None:
             accelerator.print(
@@ -496,10 +526,15 @@ def main() -> None:
             accelerator.unwrap_model(model).load_state_dict(state["model_state_dict"])
             optimizer.load_state_dict(state["optimizer_state_dict"])
             scheduler.load_state_dict(state["scheduler_state_dict"])
-            start_epoch = int(state["epoch"])      # resume at the next epoch
+            # Re-enter the epoch that was IN PROGRESS and skip ahead to the next
+            # unseen batch. Old checkpoints predate batch_in_epoch, so fall back
+            # to 0 (start the restored epoch from its first batch).
+            start_epoch = int(state["epoch"])
+            resume_batch = int(state.get("batch_in_epoch", 0))
             global_step = int(state["global_step"])
             accelerator.print(
-                f"[resume] restored epoch={start_epoch}, step={global_step}"
+                f"[resume] restored epoch={start_epoch}, "
+                f"batch_in_epoch={resume_batch}, step={global_step}"
             )
 
     # ------------------------------------------------------------------
@@ -519,6 +554,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Only the main process opens an MLflow run; worker ranks use a no-op
     # context manager so the indented training code is identical for all ranks.
+    # Log object returned to the caller (smoke test inspects these).
+    step_losses: list[float] = []
+    trained_batch_indices: dict[int, list[int]] = {}
+    final_metrics: dict[str, float] | None = None
+
     _mlflow_ctx = mlflow.start_run() if accelerator.is_main_process else contextlib.nullcontext()
     with _mlflow_ctx:
         if accelerator.is_main_process:
@@ -530,8 +570,19 @@ def main() -> None:
             model.train()
             epoch_loss_sum = 0.0
             epoch_steps = 0
+            # Reseed the shuffle generator so every epoch has a REPRODUCIBLE
+            # order — the invariant mid-epoch resume relies on: a resumed run
+            # replays this exact order and skips already-trained batches.
+            train_gen.manual_seed(seed + epoch)
+            trained_batch_indices.setdefault(epoch, [])
 
-            for batch in train_loader:
+            for batch_idx, batch in enumerate(train_loader):
+                # --- Mid-epoch resume skip ---
+                # MUST be the first statement in the body: skipped batches must
+                # not touch the optimizer, global_step, checkpointing, or eval.
+                if epoch == start_epoch and batch_idx < resume_batch:
+                    continue
+
                 optimizer.zero_grad()
 
                 # Forward pass: (B,) relevance logits.
@@ -547,6 +598,8 @@ def main() -> None:
 
                 epoch_loss_sum += loss.item()
                 epoch_steps += 1
+                step_losses.append(loss.item())
+                trained_batch_indices[epoch].append(batch_idx)
 
                 # --- Per-step MLflow logging ---
                 if accelerator.is_main_process:
@@ -571,6 +624,7 @@ def main() -> None:
                         global_step,
                         checkpoint_dir,
                         cfg_dict,
+                        batch_in_epoch=batch_idx + 1,  # next unseen batch
                     )
 
                 # --- Periodic held-out eval ---
@@ -589,6 +643,9 @@ def main() -> None:
                             f"ndcg@10={ndcg10:.4f} mrr={mrr_val:.4f}"
                         )
 
+            # After the first (possibly partial) epoch, resume skipping is done.
+            resume_batch = 0
+
             # --- End-of-epoch summary ---
             avg_loss = epoch_loss_sum / max(1, epoch_steps)
             accelerator.print(
@@ -601,18 +658,19 @@ def main() -> None:
                     step=global_step,
                 )
 
-            # Checkpoint at the end of every epoch regardless of step count,
-            # so Sol jobs that hit the wall-clock cap mid-epoch don't lose the
-            # partial progress — but also so a complete epoch is always saved.
+            # Checkpoint at the end of every epoch. batch_in_epoch=0 means the
+            # epoch is complete; on resume the loop `range` advances to the next
+            # epoch on its own (epoch is stored as-is, NOT epoch+1).
             _save_checkpoint(
                 accelerator,
                 model,
                 optimizer,
                 scheduler,
-                epoch + 1,  # epoch+1 so resume skips this completed epoch
+                epoch,
                 global_step,
                 checkpoint_dir,
                 cfg_dict,
+                batch_in_epoch=0,
             )
 
         accelerator.print("[done] training complete.")
@@ -629,6 +687,62 @@ def main() -> None:
                     "[final eval] "
                     + "  ".join(f"{k}={v:.4f}" for k, v in final_metrics.items())
                 )
+
+    return {
+        "step_losses": step_losses,
+        "trained_batch_indices": trained_batch_indices,
+        "global_step": global_step,
+        "final_metrics": final_metrics,
+    }
+
+
+def main() -> None:
+    """Parse args, build the accelerator + tokenizer, then run training."""
+    args = _build_parser().parse_args()
+
+    # ------------------------------------------------------------------
+    # 1. Load and merge config
+    # ------------------------------------------------------------------
+    cfg_dict = _load_yaml(args.config)
+    cfg = _Namespace(cfg_dict)
+
+    # CLI flags override the YAML where provided.
+    if args.pairs is not None:
+        cfg.training.pairs_file = str(args.pairs)
+    if args.val_pairs is not None:
+        cfg.training.val_pairs_file = str(args.val_pairs)
+    if args.checkpoint_dir is not None:
+        cfg.training.checkpoint_dir = str(args.checkpoint_dir)
+    if args.mlflow_dir is not None:
+        cfg.training.mlflow_dir = str(args.mlflow_dir)
+    if args.epochs is not None:
+        cfg.training.n_epochs = args.epochs
+
+    # ------------------------------------------------------------------
+    # 2. Accelerator — bf16 on A100, silent fallback to fp32 elsewhere
+    # ------------------------------------------------------------------
+    try:
+        accelerator = Accelerator(mixed_precision="bf16")
+    except (ValueError, RuntimeError):
+        accelerator = Accelerator(mixed_precision="no")
+
+    # ------------------------------------------------------------------
+    # 3. Tokenizer
+    # ------------------------------------------------------------------
+    # AutoTokenizer.from_pretrained fetches bert-base-uncased from the HuggingFace
+    # hub (or HF_HOME cache on Sol). The tokenizer is injected into the model so
+    # the reranker never imports transformers directly — it only needs the protocol.
+    tokenizer_name: str = cfg.training.tokenizer_name
+    accelerator.print(f"[tokenizer] loading {tokenizer_name} ...")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    run_training(
+        cfg,
+        tokenizer,
+        accelerator=accelerator,
+        resume=args.resume,
+        cfg_dict=cfg_dict,
+    )
 
 
 if __name__ == "__main__":
