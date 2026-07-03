@@ -214,7 +214,7 @@ When `val_pairs.jsonl` is present at `/scratch/spate472/mlrag/corpus/`, `slurm/e
 sbatch slurm/train_reranker.sh
 ```
 
-2×A100-80GB, DDP via Accelerate, bf16 mixed precision, 8 h wall clock. Training is BCEWithLogitsLoss on the (query, passage, label) pairs; AdamW with linear warmup. The job auto-detects existing checkpoints in `/scratch/spate472/mlrag/checkpoints/` and passes `--resume` to reload the latest one — so re-submitting after a wall-clock preemption picks up where it left off and is always safe.
+2×A100-80GB, DDP via Accelerate, bf16 mixed precision, 8 h wall clock. Training is BCEWithLogitsLoss on the (query, passage, label) pairs; AdamW with linear warmup then constant LR (optionally cosine decay via `training.lr_schedule`). The job auto-detects existing checkpoints in `/scratch/spate472/mlrag/checkpoints/` and passes `--resume` to reload the latest one — so re-submitting after a wall-clock preemption picks up where it left off and is always safe.
 
 ### 4. Monitor
 

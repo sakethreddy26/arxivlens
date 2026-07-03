@@ -9,7 +9,7 @@ This script wires together every component built in earlier phases:
         -> build TransformerConfig + CrossEncoderReranker
         -> build PairDataset (train + optional val)
         -> Accelerator (bf16 mixed precision on A100; CPU fallback)
-        -> AdamW + linear warmup scheduler
+        -> AdamW + linear warmup then constant LR (optional cosine decay)
         -> BCE training loop
         -> MLflow metric logging
         -> checkpoint save/resume
@@ -372,6 +372,9 @@ def run_training(
     max_input_length: int = int(cfg.model.max_input_length)
     # Gradient clipping: getattr fallback keeps old configs working (default 1.0).
     grad_clip: float = float(getattr(cfg.training, "grad_clip", 1.0))
+    # LR schedule shape after warmup: "constant" (default, unchanged numerics)
+    # or "cosine" (decay to 0 over the full run). getattr keeps old configs OK.
+    lr_schedule: str = str(getattr(cfg.training, "lr_schedule", "constant"))
 
     # ------------------------------------------------------------------
     # 2. Reproducibility seeds
@@ -486,15 +489,26 @@ def run_training(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
-    # Linear warmup: ramp from 0 -> lr over warmup_steps, then hold at lr.
-    # A constant post-warmup rate is simple and works well for short fine-tuning
-    # runs. Cosine decay would help for longer schedules but adds a hyperparameter.
+    # Two schedule shapes share the same linear warmup (0 -> lr over
+    # warmup_steps):
+    #   "constant" — hold at lr after warmup (warmup-then-CONSTANT, NOT decay).
+    #                Simple and effective for short fine-tuning runs; keeps the
+    #                default numerics identical to before this option existed.
+    #   "cosine"   — after warmup, cosine-decay the scale from 1 -> 0 over the
+    #                remaining steps of the full run (total_steps below).
+    total_steps = n_epochs * len(train_loader)
+
     def lr_lambda(step: int) -> float:
         """Return the LR scale factor at ``step`` (multiplied by base lr)."""
         if step < warmup_steps:
             # Avoid division by zero when warmup_steps == 0.
             return step / max(1, warmup_steps)
-        return 1.0  # full base lr after warmup
+        if lr_schedule == "cosine":
+            # Cosine decay from 1.0 at end-of-warmup down to 0.0 at total_steps.
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            progress = min(1.0, max(0.0, progress))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 1.0  # "constant": full base lr after warmup
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
