@@ -1,0 +1,24 @@
+model:
+  vocab_size: 30522        # bert-base-uncased vocabulary size (WordPiece)
+  d_model: 256             # residual stream width; must be divisible by n_heads
+  n_heads: 8               # parallel attention heads; d_head = d_model / n_heads = 32
+  n_layers: 4              # stacked encoder blocks
+  d_ff: 1024               # feed-forward hidden width (~4x d_model, standard)
+  max_len: 512             # positional-encoding table length; limits sequence length
+  dropout: 0.1             # applied to attention weights, FFN activations, residual branches
+  max_input_length: 256    # tokenizer truncation length for [CLS] query [SEP] passage [SEP]
+
+training:
+  pairs_file: "corpus/pairs.jsonl"          # path to training pairs (relative to repo root; --pairs overrides)
+  val_pairs_file: "corpus/val_pairs.jsonl"  # held-out validation split (--val-pairs overrides; auto-split if absent)
+  checkpoint_dir: "checkpoints"             # directory for .pt snapshots; created automatically
+  mlflow_dir: "mlruns"                      # MLflow tracking-uri directory (file:// backend)
+  learning_rate: 2.0e-4                     # AdamW base LR; linear warmup ramps up to this value
+  batch_size: 32                            # examples per gradient step; tune down if GPU OOM
+  n_epochs: 5                              # full passes over the training pairs file
+  warmup_steps: 200                         # linear LR warmup from 0 -> learning_rate over this many steps
+  checkpoint_every_steps: 500              # save a .pt snapshot every N optimizer steps
+  eval_every_steps: 500                    # run held-out eval and log val/ metrics every N steps
+  val_fraction: 0.1                        # fraction of pairs to hold out if no val_pairs_file given
+  seed: 42                                 # seeds torch, numpy, and random for reproducibility
+  tokenizer_name: "bert-base-uncased"      # HuggingFace tokenizer; loaded via AutoTokenizer.from_pretrained

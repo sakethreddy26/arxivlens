@@ -1,0 +1,39 @@
+# Badge: [![CI](https://github.com/sakethreddy26/ArXivLens/actions/workflows/ci.yml/badge.svg)](https://github.com/sakethreddy26/ArXivLens/actions/workflows/ci.yml)
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-
+
+      - name: Install CPU torch
+        run: pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Install package
+        run: pip install -e . --no-deps
+
+      - name: Lint
+        run: ruff check src/ tests/
+
+      - name: Test
+        run: pytest

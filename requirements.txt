@@ -1,0 +1,23 @@
+# Pinned to match the Sol prebuilt env `genai25.09`.
+torch==2.7.1
+transformers==4.56.1
+sentence-transformers==5.1.0
+
+# FAISS: the Sol env ships faiss 1.9.0 (GPU); locally we use the CPU wheel.
+faiss-cpu==1.9.0
+
+# Serving
+fastapi==0.115.12
+uvicorn==0.34.2
+pydantic==2.11.4
+
+# Training / tracking
+accelerate==1.7.0
+mlflow==2.22.0
+
+# Utilities
+numpy==1.26.4
+pyyaml==6.0.2
+
+# Testing
+pytest==8.3.4

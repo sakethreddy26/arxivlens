@@ -1,0 +1,22 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+*.pth
+*.egg-info
+.pytest_cache
+.ruff_cache
+
+# Large data / model artefacts — mount these at runtime, don't bake into image
+corpus/
+mlruns/
+checkpoints/
+
+# Dev-only directories not needed in the image
+notebooks/
+slurm/
+tests/
+scripts/
+
+# Docs
+*.md

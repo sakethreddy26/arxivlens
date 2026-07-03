@@ -1,0 +1,28 @@
+# Data / artifacts — live on Sol scratch, never in git
+corpus/
+index/
+checkpoints/
+logs/
+hf_cache/
+*.faiss
+*.pt
+*.safetensors
+*.jsonl
+
+# Python
+__pycache__/
+.venv/
+*.egg-info/
+.pytest_cache/
+*.py[cod]
+
+# Experiment tracking
+mlruns/
+
+# Internal planning docs — kept locally, not published
+PROGRESS.md
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
