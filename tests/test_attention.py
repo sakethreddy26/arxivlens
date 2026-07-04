@@ -6,6 +6,8 @@ is needed. Configs are tiny (d_model=32, n_heads=4, n_layers=2, small vocab)
 so the file runs in seconds.
 """
 
+import hashlib
+
 import torch
 
 from arxivlens.model.attention import (
@@ -57,7 +59,10 @@ class StubTokenizer:
     pad_token_id = PAD_ID
 
     def _word_id(self, word: str) -> int:
-        return 3 + (hash(word) % (VOCAB_SIZE - 3))
+        # md5, NOT builtin hash(): hash() is salted per process
+        # (PYTHONHASHSEED), so ids would differ across runs — the same
+        # latent-flakiness trap already fixed in test_dataset.py's stub.
+        return 3 + (int(hashlib.md5(word.encode()).hexdigest(), 16) % (VOCAB_SIZE - 3))
 
     def _encode_one(self, query: str, passage: str) -> list[int]:
         q = [self._word_id(w) for w in query.split()]
@@ -75,7 +80,14 @@ class StubTokenizer:
     ):
         rows = [self._encode_one(q, p) for q, p in zip(queries, passages)]
         if truncation:
-            rows = [r[:max_length] for r in rows]
+            # Preserve the trailing [SEP] like the real HF tokenizer
+            # (truncation=True / longest_first) always does: a naive
+            # r[:max_length] slice cuts the final [SEP] and produces a
+            # one-SEP layout production can never emit.
+            rows = [
+                r if len(r) <= max_length else r[: max_length - 1] + [SEP_ID]
+                for r in rows
+            ]
         width = max(len(r) for r in rows)
         input_ids, attention_mask = [], []
         for r in rows:

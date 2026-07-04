@@ -2,9 +2,9 @@
 
 This is the end-to-end GATE for the training code: it drives the REAL
 ``run_training`` entry point (the same function ``main`` calls) on a tiny
-CPU-only config with an offline stub tokenizer, and asserts four properties
-that together prove the loop, checkpointing, mid-epoch resume, and eval are all
-wired correctly:
+CPU-only config with an offline stub tokenizer, and asserts five properties
+that together prove the loop, checkpointing, resume (mid-epoch AND
+epoch-boundary), and eval are all wired correctly:
 
     (a) loss decreases  -- the model actually learns on the toy data.
     (b) a checkpoint file is written.
@@ -13,6 +13,9 @@ wired correctly:
         skipping none it hadn't.
     (d) eval is NON-degenerate -- at least one query group has >1 candidate and
         MRR is a real value in (0, 1].
+    (e) epoch-boundary resume -- resuming from an epoch-END checkpoint
+        (batch_in_epoch == 0) starts the NEXT epoch and never silently
+        retrains the completed one.
 
 No network, no GPU, no HuggingFace download: the tokenizer is the deterministic
 ``StubTokenizer`` from ``tests/test_dataset.py`` and everything runs in a temp
@@ -22,7 +25,7 @@ Run it directly::
 
     python scripts/smoke_test.py
 
-Exit code is 0 only when all four assertions pass.
+Exit code is 0 only when all five assertions pass.
 """
 
 from __future__ import annotations
@@ -324,10 +327,59 @@ def main() -> int:
             f"(want 0 < mrr <= 1)",
         ))
 
+        # ---------------------------------------------------------------- #
+        # (e) epoch-boundary resume: a 1-epoch run's LATEST checkpoint is the
+        # epoch-end one (stored epoch=1, batch_in_epoch=0). Resuming it with
+        # n_epochs=2 must train ONLY epoch 1 -- zero batches of epoch 0
+        # retrained -- and advance global_step by exactly one epoch's batches.
+        # This is the path assertion (c) structurally cannot cover (it
+        # filters for batch_in_epoch > 0).
+        # ---------------------------------------------------------------- #
+        end_dir = tmp / "epochend_ckpts"
+        cfg_e = _make_cfg(tmp, pairs_file, vocab_size, n_epochs=1)
+        cfg_e.training.checkpoint_dir = str(end_dir)
+        log_e_pre = run_training(cfg_e, tokenizer, accelerator=None, resume=False)
+        pre_step = int(log_e_pre["global_step"])
+
+        latest_e = _load_latest_checkpoint(end_dir)
+        st_e = torch.load(latest_e, map_location="cpu") if latest_e else {}
+        is_epoch_end = (
+            int(st_e.get("batch_in_epoch", -1)) == 0
+            and int(st_e.get("epoch", -1)) == 1
+        )
+
+        cfg_e2 = _make_cfg(tmp, pairs_file, vocab_size, n_epochs=2)
+        cfg_e2.training.checkpoint_dir = str(end_dir)
+        log_e_post = run_training(cfg_e2, tokenizer, accelerator=None, resume=True)
+
+        trained_e = log_e_post["trained_batch_indices"]
+        retrained_epoch0 = trained_e.get(0, [])
+        epoch1_batches = trained_e.get(1, [])
+        step_ok = (
+            int(log_e_post["global_step"]) == pre_step + len(epoch1_batches)
+        )
+        ok_e = (
+            is_epoch_end
+            and not retrained_epoch0
+            and len(epoch1_batches) > 0
+            and epoch1_batches[0] == 0
+            and step_ok
+        )
+        results.append(_report(
+            "(e) epoch-boundary resume",
+            ok_e,
+            f"latest_ckpt_is_epoch_end={is_epoch_end}, "
+            f"epoch0_batches_retrained={len(retrained_epoch0)} (want 0), "
+            f"epoch1_batches={len(epoch1_batches)} starting at "
+            f"{epoch1_batches[0] if epoch1_batches else '<none>'}, "
+            f"step {pre_step} -> {log_e_post['global_step']} "
+            f"(exact_advance={step_ok})",
+        ))
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    passed = all(results) and len(results) == 4
+    passed = all(results) and len(results) == 5
     print()
     print("SMOKE TEST PASSED" if passed else "SMOKE TEST FAILED")
     return 0 if passed else 1
@@ -336,12 +388,12 @@ def main() -> int:
 def _has_multi_candidate_query(pairs_file: Path, cfg: _Namespace) -> bool:
     """Return True if the auto-split val set has >=1 query group with >1 pair.
 
-    Reconstructs the SAME seeded auto-split ``run_training`` performs so we
-    verify eval saw a genuine multi-candidate ranking, not the degenerate
+    Reconstructs the SAME seeded group-wise auto-split ``run_training``
+    performs (via the shared ``group_split_indices`` helper) so we verify
+    eval saw a genuine multi-candidate ranking, not the degenerate
     one-candidate-per-query view the earlier fix removed.
     """
-    from arxivlens.data.dataset import PairDataset
-    from torch.utils.data import random_split
+    from arxivlens.data.dataset import PairDataset, group_split_indices
 
     seed = int(cfg.training.seed)
     val_fraction = float(cfg.training.val_fraction)
@@ -349,16 +401,12 @@ def _has_multi_candidate_query(pairs_file: Path, cfg: _Namespace) -> bool:
     tokenizer = StubTokenizer()
 
     full = PairDataset(str(pairs_file), tokenizer, max_length=max_len)
-    n_val = max(1, int(len(full) * val_fraction))
-    n_train = len(full) - n_val
-    gen = torch.Generator().manual_seed(seed)
-    _train, val = random_split(full, [n_train, n_val], generator=gen)
+    qids = full.query_ids()
+    _train_idx, val_idx = group_split_indices(qids, val_fraction, seed)
 
     counts: dict[str, int] = {}
-    for idx in val.indices:
-        item = full[idx]
-        qid = item["query_id"]
-        counts[qid] = counts.get(qid, 0) + 1
+    for idx in val_idx:
+        counts[qids[idx]] = counts.get(qids[idx], 0) + 1
     return any(c > 1 for c in counts.values())
 
 
