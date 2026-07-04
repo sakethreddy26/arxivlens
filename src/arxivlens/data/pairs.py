@@ -152,13 +152,13 @@ def build_pairs(
         # 2) Hard negatives: nearest FAISS neighbours that aren't the source.
         if n_hard > 0:
             # Ask for a couple extra candidates to give some slack for skipping
-            # the true paper or a candidate we can't resolve. This is
-            # best-effort, NOT a guarantee: the true paper may appear, several
-            # neighbours may be unresolvable, or the index may be tiny — in
-            # which case we simply yield fewer than n_hard hard negatives (the
-            # loop below handles the shortfall). See on_empty_neighbors for the
-            # dead/empty-index guard.
-            candidates = neighbor_fn(idx, n_hard + 1)
+            # the true paper, a duplicate-content copy of it, or a candidate we
+            # can't resolve. This is best-effort, NOT a guarantee: the true
+            # paper may appear, several neighbours may be unresolvable, or the
+            # index may be tiny — in which case we simply yield fewer than
+            # n_hard hard negatives (the loop below handles the shortfall). See
+            # on_empty_neighbors for the dead/empty-index guard.
+            candidates = neighbor_fn(idx, n_hard + 2)
             if not candidates and on_empty_neighbors is not None:
                 on_empty_neighbors(idx)
             taken = 0
@@ -167,11 +167,18 @@ def build_pairs(
                     break
                 if cand_idx in used or not (0 <= cand_idx < n_records):
                     continue
+                passage = _text(records[cand_idx], abstract_key)
+                # Skip duplicate CONTENT, not just the self row: a corpus can
+                # contain the same paper twice (e.g. arXiv v1/v2), and its
+                # near-identical abstract would otherwise be labeled 0 in the
+                # same query group as the positive.
+                if passage == positive_passage:
+                    continue
                 used.add(cand_idx)
                 yield Pair(
                     query_id=query_id,
                     query=query,
-                    passage=_text(records[cand_idx], abstract_key),
+                    passage=passage,
                     label=0,
                 )
                 taken += 1
@@ -180,14 +187,22 @@ def build_pairs(
         if n_easy > 0:
             pool = [i for i in range(n_records) if i not in used]
             rng.shuffle(pool)
-            for cand_idx in pool[:n_easy]:
+            taken_easy = 0
+            for cand_idx in pool:
+                if taken_easy >= n_easy:
+                    break
+                passage = _text(records[cand_idx], abstract_key)
+                # Same duplicate-content guard as for hard negatives.
+                if passage == positive_passage:
+                    continue
                 used.add(cand_idx)
                 yield Pair(
                     query_id=query_id,
                     query=query,
-                    passage=_text(records[cand_idx], abstract_key),
+                    passage=passage,
                     label=0,
                 )
+                taken_easy += 1
 
 
 def build_pairs_list(

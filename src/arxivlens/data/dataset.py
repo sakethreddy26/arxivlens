@@ -17,9 +17,10 @@ bridges that file to a :class:`torch.utils.data.DataLoader` by:
 
 Input contract (pairs.jsonl schema)
 ------------------------------------
-Each line is a JSON object with exactly three fields::
+Each line is a JSON object with four fields::
 
-    {"query": "<string>", "passage": "<string>", "label": 0 | 1}
+    {"query": "<string>", "passage": "<string>", "label": 0 | 1,
+     "query_id": "<string>"}
 
 ``label`` must be an integer in ``{0, 1}`` — the BCE loss head in the trainer
 requires float conversion, which :class:`PairDataset` performs.
@@ -41,12 +42,48 @@ NOT import ``transformers`` and does NOT hit the network.
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
+
+
+def group_split_indices(
+    query_ids: Sequence[str], val_fraction: float, seed: int
+) -> tuple[list[int], list[int]]:
+    """Split example indices into train/val by WHOLE query group.
+
+    A pair-level split (shuffle + slice of individual examples) orphans query
+    groups across the train/val boundary: a val group whose only positive
+    landed in train scores a forced 0.0, and a positive-only singleton scores
+    a trivial 1.0, so macro-averaged ranking metrics converge toward the
+    label ratio regardless of model quality. Splitting by query_id keeps
+    every candidate group intact on one side of the boundary.
+
+    This helper is the single source of truth for the auto-split — the
+    trainer (train_reranker.py) and the SLURM eval mirror
+    (slurm/eval_reranker.sh) must both call it so their val sets match 1:1.
+
+    Args:
+        query_ids: query_id of every example, in dataset index order.
+        val_fraction: fraction of QUERY GROUPS (not pairs) held out for val.
+        seed: seed for the group shuffle; same seed -> same split.
+
+    Returns:
+        ``(train_indices, val_indices)`` — disjoint, order-preserving index
+        lists covering ``range(len(query_ids))``. Val gets at least one group
+        when any groups exist.
+    """
+    unique = sorted(set(query_ids))
+    random.Random(seed).shuffle(unique)
+    n_val = max(1, int(len(unique) * val_fraction)) if unique else 0
+    val_groups = set(unique[len(unique) - n_val :])
+    train_idx = [i for i, q in enumerate(query_ids) if q not in val_groups]
+    val_idx = [i for i, q in enumerate(query_ids) if q in val_groups]
+    return train_idx, val_idx
 
 
 class PairDataset(Dataset):
@@ -73,9 +110,12 @@ class PairDataset(Dataset):
             "input_ids":      LongTensor of shape (seq_len,),
             "attention_mask": LongTensor of shape (seq_len,),
             "label":          FloatTensor scalar (0.0 or 1.0),
-            "query_id":       str (groups candidates for eval; falls back to the
-                              positional index when the record lacks the key),
+            "query_id":       str (groups candidates for eval),
         }
+
+    Raises:
+        ValueError: If the first record lacks a ``query_id`` field (legacy
+            pairs file) — regenerate the file with ``scripts/build_pairs.py``.
 
     Tokenization is **lazy** — it happens at ``__getitem__`` time, not at
     construction time, so constructing the dataset is O(1) in memory even for
@@ -99,6 +139,17 @@ class PairDataset(Dataset):
         with self._path.open(encoding="utf-8") as fh:
             self._lines: list[str] = [line for line in fh if line.strip()]
 
+        # Loud schema check: legacy pairs files predate the query_id field.
+        # Silently falling back to one-group-per-row would collapse all
+        # grouped ranking metrics to a constant, so fail fast instead.
+        if self._lines:
+            first_record: dict[str, Any] = json.loads(self._lines[0])
+            if "query_id" not in first_record:
+                raise ValueError(
+                    f"pairs file missing query_id ({self._path}) — regenerate "
+                    "with scripts/build_pairs.py"
+                )
+
     # ---------------------------------------------------------------------- #
     # Dataset interface                                                        #
     # ---------------------------------------------------------------------- #
@@ -106,6 +157,20 @@ class PairDataset(Dataset):
     def __len__(self) -> int:
         """Number of (query, passage, label) examples in the file."""
         return len(self._lines)
+
+    def query_ids(self) -> list[str]:
+        """Return the ``query_id`` of every example, in index order.
+
+        Parses each stored line once (JSON only — no tokenization), so it is
+        cheap enough for the trainer to call at start-up when building the
+        group-wise train/val split via :func:`group_split_indices`. Mirrors
+        the ``__getitem__`` totality guard: a malformed mixed-schema record
+        missing ``query_id`` falls back to its positional index.
+        """
+        return [
+            str(json.loads(line).get("query_id", i))
+            for i, line in enumerate(self._lines)
+        ]
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """Tokenize the pair at ``idx`` and return tensors.
@@ -119,15 +184,16 @@ class PairDataset(Dataset):
             * ``"input_ids"`` — ``LongTensor`` of shape ``(seq_len,)``.
             * ``"attention_mask"`` — ``LongTensor`` of shape ``(seq_len,)``.
             * ``"label"`` — ``FloatTensor`` scalar (0.0 or 1.0).
-            * ``"query_id"`` — ``str`` grouping key (defaults to ``str(idx)``
-              when the record has no ``query_id`` field).
+            * ``"query_id"`` — ``str`` grouping key.
         """
         record: dict[str, Any] = json.loads(self._lines[idx])
         query: str = record["query"]
         passage: str = record["passage"]
         label: int = int(record["label"])
-        # query_id groups candidates for a single ranking during eval. Older
-        # pairs files predate this field, so fall back to the positional index.
+        # query_id groups candidates for a single ranking during eval. The
+        # constructor validates the first record, so a missing field here is a
+        # malformed mixed-schema file; the positional-index fallback keeps
+        # __getitem__ total, but such files should be regenerated.
         query_id: str = str(record.get("query_id", idx))
 
         # The tokenizer is called with the query and passage as a pair so it

@@ -285,22 +285,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if pair.label == 1:
                     n_pos += 1
     else:
-        # Materialise all pair dicts, shuffle deterministically, then hold out
-        # the last VAL_FRACTION as the validation split. Using a fresh
-        # random.Random(seed) keeps the split reproducible and independent of
-        # however many draws the generation RNG consumed.
-        #
-        # NOTE: the shuffle operates on individual pairs, so a single query_id's
-        # candidates may end up split across the train/val files. That is
-        # acceptable — _run_eval groups by query_id across the whole val loader
-        # and handles a variable number of candidates per query.
+        # Materialise all pair dicts, then split GROUP-WISE by query_id:
+        # shuffle the unique query ids with a fresh random.Random(seed)
+        # (reproducible, independent of however many draws the generation RNG
+        # consumed) and hold out the last VAL_FRACTION of QUERIES — whole
+        # candidate groups — as validation. Splitting individual pairs would
+        # orphan groups across the boundary: a val query whose only positive
+        # landed in train scores a forced 0.0, a positive-only singleton a
+        # trivial 1.0, so the macro-averaged ranking metrics would converge
+        # toward the label ratio regardless of model quality.
         pair_dicts = [pair.as_dict() for pair in generated]
-        random.Random(args.seed).shuffle(pair_dicts)
 
-        n_val = max(1, int(len(pair_dicts) * VAL_FRACTION)) if pair_dicts else 0
-        n_train = len(pair_dicts) - n_val
-        train_dicts = pair_dicts[:n_train]
-        val_dicts = pair_dicts[n_train:]
+        query_ids = sorted({str(d["query_id"]) for d in pair_dicts})
+        random.Random(args.seed).shuffle(query_ids)
+
+        n_val_queries = (
+            max(1, int(len(query_ids) * VAL_FRACTION)) if query_ids else 0
+        )
+        val_query_ids = set(query_ids[len(query_ids) - n_val_queries :])
+
+        train_dicts = [
+            d for d in pair_dicts if str(d["query_id"]) not in val_query_ids
+        ]
+        val_dicts = [d for d in pair_dicts if str(d["query_id"]) in val_query_ids]
+        n_train = len(train_dicts)
+        n_val = len(val_dicts)
 
         args.val_output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("w", encoding="utf-8") as fh:
@@ -314,8 +323,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         n_pos = sum(1 for d in pair_dicts if d.get("label") == 1)
         print(
             f"[split] {n_train} train -> {args.output} | "
-            f"{n_val} val -> {args.val_output} "
-            f"(val_fraction={VAL_FRACTION}, seed={args.seed})"
+            f"{n_val} val ({n_val_queries} query groups) -> {args.val_output} "
+            f"(val_fraction={VAL_FRACTION} of queries, seed={args.seed})"
         )
 
     n_neg = total - n_pos

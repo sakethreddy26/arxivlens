@@ -152,7 +152,7 @@ sys.path.insert(0, os.path.join(repo_dir, "src"))
 
 from arxivlens.model.transformer import TransformerConfig
 from arxivlens.model.reranker import CrossEncoderReranker
-from arxivlens.data.dataset import PairDataset, collate_fn
+from arxivlens.data.dataset import PairDataset, collate_fn, group_split_indices
 from arxivlens.train.eval import evaluate_rankings
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -210,21 +210,21 @@ if os.path.exists(val_pairs):
     dataset = PairDataset(val_pairs, tokenizer, max_length=max_input_length)
     eval_source = val_pairs
 elif train_pairs and os.path.exists(train_pairs):
-    # No explicit split: hold out the last VAL_FRACTION of the training pairs
-    # via a seeded random_split, mirroring train_reranker.py so the eval set
-    # matches the trainer's val set 1:1.
+    # No explicit split: hold out VAL_FRACTION of the QUERY GROUPS via the
+    # shared seeded group_split_indices helper, mirroring train_reranker.py
+    # so the eval set matches the trainer's val set 1:1 (whole query groups,
+    # never orphaned candidates).
     print(f"[eval] No val_pairs file; auto-splitting from: {train_pairs}")
     full_dataset = PairDataset(train_pairs, tokenizer, max_length=max_input_length)
-    n_val = max(1, int(len(full_dataset) * VAL_FRACTION))
-    n_train = len(full_dataset) - n_val
+    _train_idx, val_idx = group_split_indices(
+        full_dataset.query_ids(), VAL_FRACTION, SEED
+    )
     print(
-        f"[eval] auto-splitting: {n_train} train / {n_val} val "
-        f"(val_fraction={VAL_FRACTION}, seed={SEED})"
+        f"[eval] auto-splitting by query group: "
+        f"{len(full_dataset) - len(val_idx)} train / {len(val_idx)} val "
+        f"(val_fraction={VAL_FRACTION} of query groups, seed={SEED})"
     )
-    generator = torch.Generator().manual_seed(SEED)
-    _train_dataset, dataset = torch.utils.data.random_split(
-        full_dataset, [n_train, n_val], generator=generator
-    )
+    dataset = torch.utils.data.Subset(full_dataset, val_idx)
     eval_source = f"{train_pairs} (auto-split val_fraction={VAL_FRACTION})"
 else:
     # Neither source exists — the bash guard above should have caught this, but

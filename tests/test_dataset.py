@@ -80,9 +80,12 @@ class StubTokenizer:
             ids += [self._word_to_id(w) for w in text_b.split()]
             ids.append(self.sep_token_id)
 
-        # Right-truncate to max_length.
+        # Right-truncate to max_length, preserving the trailing [SEP] like
+        # the real HF tokenizer (truncation=True / longest_first) always
+        # does: a naive ids[:max_length] slice would cut the final [SEP] and
+        # produce a one-SEP layout production can never emit.
         if truncation and len(ids) > max_length:
-            ids = ids[:max_length]
+            ids = ids[: max_length - 1] + [self.sep_token_id]
 
         mask = [1] * len(ids)
 
@@ -95,6 +98,31 @@ class StubTokenizer:
         """Map integer ids back to placeholder token strings."""
         special = {self.cls_token_id: "[CLS]", self.sep_token_id: "[SEP]"}
         return [special.get(i, f"tok_{i}") for i in ids]
+
+
+def test_truncated_encoding_preserves_both_seps():
+    """Truncation must mirror HF semantics: both [SEP]s survive.
+
+    The real HF tokenizer (``truncation=True`` / longest_first) always keeps
+    the final [SEP]; a stub that naively slices ``ids[:max_length]`` would cut
+    it, silently exercising a one-SEP geometry production can never emit.
+    """
+    tok = StubTokenizer()
+    max_length = 12
+    # Short query + long passage: the truncation cut lands inside the
+    # passage segment (as HF longest_first would arrange), so the query,
+    # its [SEP], and the forced trailing [SEP] must all survive.
+    short_query = " ".join(f"qword{i}" for i in range(4))
+    long_passage = " ".join(f"pword{i}" for i in range(20))
+
+    encoded = tok(short_query, long_passage, max_length=max_length, truncation=True)
+    ids = encoded["input_ids"][0].tolist()
+
+    assert len(ids) == max_length
+    assert ids[0] == tok.cls_token_id
+    # Exactly two [SEP]s, and the sequence still ENDS with one.
+    assert ids.count(tok.sep_token_id) == 2
+    assert ids[-1] == tok.sep_token_id
 
 
 # --------------------------------------------------------------------------- #
@@ -160,19 +188,20 @@ def test_collate_carries_query_ids(dataset: PairDataset) -> None:
     assert batch["query_ids"] == ["q0", "q0", "q1"]
 
 
-def test_getitem_query_id_defaults_when_absent(
-    tmp_path: Path, tokenizer: StubTokenizer
-) -> None:
-    """A record without a query_id field falls back to str(idx)."""
+def test_missing_query_id_raises(tmp_path: Path, tokenizer: StubTokenizer) -> None:
+    """A legacy pairs file without query_id fails loudly at construction.
+
+    Silently falling back to one-group-per-row would collapse all grouped
+    ranking metrics to a constant, so the constructor must raise instead.
+    """
     path = tmp_path / "no_qid.jsonl"
     path.write_text(
         json.dumps({"query": "a b", "passage": "c d", "label": 1}) + "\n"
         + json.dumps({"query": "e f", "passage": "g h", "label": 0}) + "\n",
         encoding="utf-8",
     )
-    ds = PairDataset(path, tokenizer, max_length=64)
-    assert ds[0]["query_id"] == "0"
-    assert ds[1]["query_id"] == "1"
+    with pytest.raises(ValueError, match="missing query_id"):
+        PairDataset(path, tokenizer, max_length=64)
 
 
 def test_word_id_is_process_stable() -> None:
@@ -278,7 +307,7 @@ def test_positive_label(pairs_file: Path, tokenizer: StubTokenizer) -> None:
     # Write a single positive example.
     path = pairs_file.parent / "positive.jsonl"
     path.write_text(
-        json.dumps({"query": "deep learning", "passage": "neural networks", "label": 1}) + "\n",
+        json.dumps({"query_id": "q0", "query": "deep learning", "passage": "neural networks", "label": 1}) + "\n",
         encoding="utf-8",
     )
     ds = PairDataset(path, tokenizer)
@@ -294,7 +323,7 @@ def test_negative_label(pairs_file: Path, tokenizer: StubTokenizer) -> None:
     """A pair with label=0 in the JSONL file comes back as label tensor == 0.0."""
     path = pairs_file.parent / "negative.jsonl"
     path.write_text(
-        json.dumps({"query": "random query", "passage": "unrelated passage", "label": 0}) + "\n",
+        json.dumps({"query_id": "q0", "query": "random query", "passage": "unrelated passage", "label": 0}) + "\n",
         encoding="utf-8",
     )
     ds = PairDataset(path, tokenizer)
