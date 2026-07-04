@@ -64,10 +64,10 @@ import torch
 import yaml
 from accelerate import Accelerator
 from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
 
-from arxivlens.data.dataset import PairDataset, collate_fn
+from arxivlens.data.dataset import PairDataset, collate_fn, group_split_indices
 from arxivlens.model.reranker import CrossEncoderReranker
 from arxivlens.model.transformer import TransformerConfig
 from arxivlens.train.eval import evaluate_rankings
@@ -151,14 +151,18 @@ def _save_checkpoint(
         model: the (potentially DDP-wrapped) reranker.
         optimizer: AdamW, mid-training state.
         scheduler: LambdaLR warmup scheduler.
-        epoch: epoch currently IN PROGRESS (0-based; NOT epoch+1). Resume
-            re-enters this epoch and skips ahead to ``batch_in_epoch``.
+        epoch: epoch to RESUME INTO (0-based). Step checkpoints pass the
+            epoch currently in progress (resume re-enters it and skips ahead
+            to ``batch_in_epoch``); epoch-end checkpoints pass ``epoch + 1``
+            (with ``batch_in_epoch=0``) so resume starts the NEXT epoch
+            instead of silently retraining the completed one.
         step: global optimizer step count.
         checkpoint_dir: directory to write into; created if absent.
         cfg_dict: raw YAML config dict for provenance.
         batch_in_epoch: index of the NEXT unseen batch within ``epoch`` (i.e.
-            ``batch_idx + 1`` at step-checkpoint time; ``0`` at end of epoch).
-            Resume skips batches with ``batch_idx < batch_in_epoch``.
+            ``batch_idx + 1`` at step-checkpoint time; ``0`` at an epoch-end
+            checkpoint). Resume skips batches with ``batch_idx <
+            batch_in_epoch``.
     """
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -176,6 +180,10 @@ def _save_checkpoint(
         "epoch": epoch,
         "global_step": step,
         "batch_in_epoch": batch_in_epoch,  # next unseen batch within `epoch`
+        # batch_in_epoch is a PER-RANK batch index: under DDP the loader is
+        # sharded, so the same index means different data at a different
+        # world size. Record num_processes so resume can refuse a mismatch.
+        "num_processes": accelerator.num_processes,
         "config": cfg_dict,  # raw YAML dict for reproducibility
     }
 
@@ -234,7 +242,14 @@ def _run_eval(
     try:
         with torch.no_grad():
             for batch in val_loader:
-                logits = model(batch["input_ids"], batch["attention_mask"])  # (B,)
+                # val_loader is a plain (un-prepared) DataLoader over the FULL
+                # val set — accelerate must not shard it, or this main-rank-only
+                # eval would score just 1/N of the queries with groups truncated
+                # at shard boundaries. Batches therefore arrive on CPU and are
+                # moved to the right device here.
+                input_ids = batch["input_ids"].to(accelerator.device)
+                attention_mask = batch["attention_mask"].to(accelerator.device)
+                logits = model(input_ids, attention_mask)  # (B,)
                 scores = logits.cpu().float().tolist()
                 labels = batch["labels"].cpu().float().tolist()
                 query_ids = batch["query_ids"]
@@ -438,25 +453,30 @@ def run_training(
         val_dataset = PairDataset(str(val_path), tokenizer, max_length=max_input_length)
         train_dataset = full_dataset
     else:
-        # Hold out val_fraction of the training set for monitoring.
-        n_val = max(1, int(len(full_dataset) * val_fraction))
-        n_train = len(full_dataset) - n_val
-        accelerator.print(
-            f"[data] auto-splitting: {n_train} train / {n_val} val "
-            f"(val_fraction={val_fraction})"
+        # Hold out val_fraction of the QUERY GROUPS for monitoring. A
+        # pair-level random_split would orphan groups across the train/val
+        # boundary (forced 0.0 for no-positive groups, trivial 1.0 for
+        # positive-only singletons), biasing every ranking metric toward the
+        # label ratio. group_split_indices assigns WHOLE query_id groups to
+        # val and is seeded by `seed` alone so the split is reproducible
+        # (the eval_reranker.sh mirror depends on that).
+        train_idx, val_idx = group_split_indices(
+            full_dataset.query_ids(), val_fraction, seed
         )
-        # Use a seeded generator so the split is reproducible.
-        generator = torch.Generator().manual_seed(seed)
-        train_dataset, val_dataset = random_split(
-            full_dataset, [n_train, n_val], generator=generator
+        train_dataset = Subset(full_dataset, train_idx)
+        val_dataset = Subset(full_dataset, val_idx)
+        accelerator.print(
+            f"[data] auto-splitting by query group: {len(train_idx)} train / "
+            f"{len(val_idx)} val pairs (val_fraction={val_fraction} of query "
+            "groups)"
         )
 
     # A dedicated generator drives the train shuffle so we can reseed it
     # deterministically at the top of each epoch (manual_seed(seed + epoch)).
     # That reproducible per-epoch order is what makes mid-epoch resume correct:
     # the resumed run replays the SAME shuffled order and skips already-seen
-    # batches. This generator is SEPARATE from the random_split generator above,
-    # which stays seeded by `seed` alone so the val split is reproducible (the
+    # batches. This generator is SEPARATE from the group_split_indices seed
+    # above, which stays `seed` alone so the val split is reproducible (the
     # eval_reranker.sh mirror depends on that).
     train_gen = torch.Generator()
     train_loader = DataLoader(
@@ -515,8 +535,13 @@ def run_training(
     # ------------------------------------------------------------------
     # 8. Accelerate wrapping (handles device placement, DDP, mixed prec.)
     # ------------------------------------------------------------------
-    model, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader
+    # val_loader is deliberately NOT prepared: accelerator.prepare would shard
+    # it across ranks, so the main-rank-only eval in _run_eval would see just
+    # ~1/N of the val set with query groups truncated at shard boundaries.
+    # It stays a plain DataLoader over the FULL val set; _run_eval moves each
+    # batch to accelerator.device itself.
+    model, optimizer, train_loader = accelerator.prepare(
+        model, optimizer, train_loader
     )
 
     # ------------------------------------------------------------------
@@ -542,12 +567,31 @@ def run_training(
             accelerator.unwrap_model(model).load_state_dict(state["model_state_dict"])
             optimizer.load_state_dict(state["optimizer_state_dict"])
             scheduler.load_state_dict(state["scheduler_state_dict"])
-            # Re-enter the epoch that was IN PROGRESS and skip ahead to the next
-            # unseen batch. Old checkpoints predate batch_in_epoch, so fall back
-            # to 0 (start the restored epoch from its first batch).
+            # Step checkpoints store the epoch IN PROGRESS (resume re-enters
+            # it and skips to batch_in_epoch); epoch-end checkpoints store
+            # epoch+1 with batch_in_epoch=0 (resume starts the next epoch).
+            # Old checkpoints predate batch_in_epoch, so fall back to 0.
             start_epoch = int(state["epoch"])
             resume_batch = int(state.get("batch_in_epoch", 0))
             global_step = int(state["global_step"])
+            # batch_in_epoch counts PER-RANK sharded batches, so a mid-epoch
+            # resume at a different world size would silently skip the wrong
+            # data. Refuse loudly instead of corrupting the run.
+            ckpt_world = state.get("num_processes")
+            if (
+                ckpt_world is not None
+                and int(ckpt_world) != accelerator.num_processes
+                and resume_batch > 0
+            ):
+                raise RuntimeError(
+                    f"checkpoint {latest} was saved mid-epoch with "
+                    f"num_processes={ckpt_world} but this run has "
+                    f"num_processes={accelerator.num_processes}; "
+                    "batch_in_epoch is a per-rank index, so resuming at a "
+                    "different world size would skip the wrong batches. "
+                    "Resume with the same GPU count, or restart from an "
+                    "epoch-end checkpoint (batch_in_epoch=0)."
+                )
             accelerator.print(
                 f"[resume] restored epoch={start_epoch}, "
                 f"batch_in_epoch={resume_batch}, step={global_step}"
@@ -691,15 +735,20 @@ def run_training(
                     step=global_step,
                 )
 
-            # Checkpoint at the end of every epoch. batch_in_epoch=0 means the
-            # epoch is complete; on resume the loop `range` advances to the next
-            # epoch on its own (epoch is stored as-is, NOT epoch+1).
+            # Checkpoint at the end of every epoch. Save epoch + 1 with
+            # batch_in_epoch=0 so resume starts the NEXT epoch: storing the
+            # completed epoch as-is would make `range(start_epoch, ...)`
+            # re-enter it and silently retrain the whole epoch (pushing
+            # global_step and the cosine schedule past total_steps). The +1
+            # also gives this file a different name from a step checkpoint
+            # written at the last batch of the epoch, so it no longer
+            # overwrites that valid resume point.
             _save_checkpoint(
                 accelerator,
                 model,
                 optimizer,
                 scheduler,
-                epoch,
+                epoch + 1,
                 global_step,
                 checkpoint_dir,
                 cfg_dict,
