@@ -58,6 +58,11 @@ class TransformerConfig:
             raise ValueError(
                 f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
             )
+        if self.d_model % 2 != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) must be even: sinusoidal PositionalEncoding "
+                f"builds paired sin/cos channels and cannot fill an odd final dimension."
+            )
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -99,6 +104,15 @@ class ScaledDotProductAttention(nn.Module):
             # Use the dtype's most negative finite value rather than -inf:
             # softmax maps it to ~0 without producing NaNs if a row is
             # ever fully masked.
+            #
+            # Deliberate contract: masked positions are filled with the dtype's
+            # finite min (not -inf) so a fully-masked row degrades to a uniform
+            # distribution rather than NaN. In this reranker no row is ever
+            # fully masked (every query attends to [CLS] + real tokens) and
+            # padded query rows' outputs are discarded before [CLS] pooling, so
+            # uniform-vs-zero on such rows never affects the score. If this
+            # module is reused where a row can be fully masked and must output
+            # zeros, revisit this fill value.
             scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
 
         attention_weights = torch.softmax(scores, dim=-1)  # (batch, n_heads, q_len, k_len)
