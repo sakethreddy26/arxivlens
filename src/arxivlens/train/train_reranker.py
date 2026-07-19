@@ -73,6 +73,12 @@ from arxivlens.model.transformer import TransformerConfig
 from arxivlens.train.eval import evaluate_rankings
 
 
+def _mlflow_safe(name: str) -> str:
+    """MLflow metric names may not contain '@'; map it to '_at_' (e.g.
+    'val/ndcg@5' -> 'val/ndcg_at_5'). Other chars are already MLflow-legal."""
+    return name.replace("@", "_at_")
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -705,7 +711,7 @@ def run_training(
                 ):
                     metrics = _run_eval(model, val_loader, accelerator)
                     mlflow.log_metrics(
-                        {f"val/{k}": v for k, v in metrics.items()},
+                        {_mlflow_safe(f"val/{k}"): v for k, v in metrics.items()},
                         step=global_step,
                     )
                     # Print a quick summary so Sol logs show progress.
@@ -762,7 +768,10 @@ def run_training(
         if val_loader is not None and accelerator.is_main_process:
             final_metrics = _run_eval(model, val_loader, accelerator)
             mlflow.log_metrics(
-                {f"val/final_{k}": v for k, v in final_metrics.items()},
+                {
+                    _mlflow_safe(f"val/final_{k}"): v
+                    for k, v in final_metrics.items()
+                },
                 step=global_step,
             )
             accelerator.print(
