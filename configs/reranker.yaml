@@ -1,9 +1,9 @@
 model:
   vocab_size: 30522        # bert-base-uncased vocabulary size (WordPiece)
-  d_model: 256             # residual stream width; must be divisible by n_heads
-  n_heads: 8               # parallel attention heads; d_head = d_model / n_heads = 32
-  n_layers: 4              # stacked encoder blocks
-  d_ff: 1024               # feed-forward hidden width (~4x d_model, standard)
+  d_model: 512             # residual stream width; must be divisible by n_heads
+  n_heads: 8               # parallel attention heads; d_head = d_model / n_heads = 64
+  n_layers: 6              # stacked encoder blocks
+  d_ff: 2048               # feed-forward hidden width (~4x d_model, standard)
   max_len: 512             # positional-encoding table length; limits sequence length
   dropout: 0.1             # applied to attention weights, FFN activations, residual branches
   max_input_length: 256    # tokenizer truncation length for [CLS] query [SEP] passage [SEP]
@@ -14,8 +14,8 @@ training:
   checkpoint_dir: "checkpoints"             # directory for .pt snapshots; created automatically
   mlflow_dir: "mlruns"                      # MLflow tracking-uri directory (file:// backend)
   learning_rate: 2.0e-4                     # AdamW base LR; linear warmup ramps up to this value
-  batch_size: 32                            # examples per gradient step; tune down if GPU OOM
-  n_epochs: 5                              # full passes over the training pairs file
+  batch_size: 128                           # examples per gradient step; fits 2x 80GB A100 headroom
+  n_epochs: 8                              # full passes over the training pairs file
   warmup_steps: 200                         # linear LR warmup from 0 -> learning_rate over this many steps
   lr_schedule: "constant"                   # "constant" (warmup->hold) or "cosine" (warmup->cosine decay to 0)
   grad_clip: 1.0                            # max global grad norm before optimizer.step (<=0 disables)

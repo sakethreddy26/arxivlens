@@ -14,10 +14,10 @@
 # MONITORING
 # ----------
 #   Stream live output while the job runs:
-#     tail -f /scratch/spate472/mlrag/logs/train_<JOBID>.out
+#     tail -f /scratch/$USER/mlrag/logs/train_<JOBID>.out
 #
 #   View metrics in the MLflow UI (run on a login node or forwarded port):
-#     mlflow ui --backend-store-uri /scratch/spate472/mlrag/mlruns
+#     mlflow ui --backend-store-uri /scratch/$USER/mlrag/mlruns
 #
 # NOTES
 # -----
@@ -34,8 +34,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=08:00:00
-#SBATCH --output=/scratch/spate472/mlrag/logs/train_%j.out
-#SBATCH --error=/scratch/spate472/mlrag/logs/train_%j.err
+#SBATCH --output=/scratch/%u/mlrag/logs/train_%j.out
+#SBATCH --error=/scratch/%u/mlrag/logs/train_%j.err
 
 # Abort immediately on any unset variable, pipeline failure, or non-zero exit.
 # This prevents silent partial failures that are hard to diagnose from HPC logs.
@@ -61,7 +61,7 @@ echo "============================================================"
 # Tell HuggingFace where to find pre-downloaded model weights on scratch.
 # /scratch is a high-throughput Lustre filesystem; the home quota is too small
 # for model caches.
-export HF_HOME=/scratch/spate472/hf_cache
+export HF_HOME=/scratch/$USER/hf_cache
 
 # Prevent AutoTokenizer / AutoModel from trying to reach the HF Hub during
 # training.  All required weights must be in HF_HOME already (downloaded once
@@ -77,7 +77,7 @@ export TOKENIZERS_PARALLELISM=false
 
 # Tell MLflow where to write experiment metadata.  Both the trainer (--mlflow-dir)
 # and this env var point to the same directory so `mlflow ui` finds everything.
-export MLFLOW_TRACKING_URI=/scratch/spate472/mlrag/mlruns
+export MLFLOW_TRACKING_URI=/scratch/$USER/mlrag/mlruns
 
 # Cap the number of OpenMP threads per process.  With 2 DDP workers sharing
 # 8 CPUs, each gets 4; leaving this unset lets PyTorch/OpenBLAS spawn 8 each,
@@ -94,9 +94,14 @@ module load mamba/latest            # makes `source activate` available
 # torch, etc.  Using the absolute path bypasses any .conda/environments.txt
 # lookup, which is more robust on shared systems where multiple users may have
 # similarly-named envs.
+# Conda environment to activate. Defaults to the prebuilt genai25.09 env.
+# If Sol provisions a different env, override without editing this file:
+#   export ARXIVLENS_ENV=/path/to/your/env  (then sbatch as normal)
+CONDA_ENV="${ARXIVLENS_ENV:-/packages/envs/genai25.09}"
 # shellcheck disable=SC1091
-source activate /packages/envs/genai25.09
+source activate "$CONDA_ENV"
 
+echo "[env] Conda   : $CONDA_ENV"
 echo "[env] Python : $(which python)"
 echo "[env] PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 echo "[env] CUDA   : $(python -c 'import torch; print(torch.version.cuda)')"
@@ -104,8 +109,8 @@ echo "[env] CUDA   : $(python -c 'import torch; print(torch.version.cuda)')"
 # =============================================================================
 # 4. Path variables — edit these if you relocate the data or repo
 # =============================================================================
-REPO_DIR=/home/spate472/arxivlens          # git clone root
-SCRATCH=/scratch/spate472/mlrag            # top-level scratch directory
+REPO_DIR="$HOME/arxivlens"                 # git clone root
+SCRATCH="/scratch/$USER/mlrag"             # top-level scratch directory
 
 PAIRS_FILE=$SCRATCH/corpus/pairs.jsonl     # training pairs from build_pairs
 VAL_PAIRS_FILE=$SCRATCH/corpus/val_pairs.jsonl  # held-out validation split

@@ -25,7 +25,7 @@
 #
 # MONITORING
 # ----------
-#   tail -f /scratch/spate472/mlrag/logs/eval_<JOBID>.out
+#   tail -f /scratch/$USER/mlrag/logs/eval_<JOBID>.out
 # =============================================================================
 
 #SBATCH --job-name=arxivlens-eval
@@ -36,8 +36,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=01:00:00
-#SBATCH --output=/scratch/spate472/mlrag/logs/eval_%j.out
-#SBATCH --error=/scratch/spate472/mlrag/logs/eval_%j.err
+#SBATCH --output=/scratch/%u/mlrag/logs/eval_%j.out
+#SBATCH --error=/scratch/%u/mlrag/logs/eval_%j.err
 
 # Abort immediately on any unset variable, pipeline failure, or non-zero exit.
 set -euo pipefail
@@ -57,10 +57,10 @@ echo "============================================================"
 # =============================================================================
 # 2. Environment variables (same rationale as train_reranker.sh)
 # =============================================================================
-export HF_HOME=/scratch/spate472/hf_cache
+export HF_HOME=/scratch/$USER/hf_cache
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
-export MLFLOW_TRACKING_URI=/scratch/spate472/mlrag/mlruns
+export MLFLOW_TRACKING_URI=/scratch/$USER/mlrag/mlruns
 export OMP_NUM_THREADS=4
 
 # =============================================================================
@@ -68,17 +68,22 @@ export OMP_NUM_THREADS=4
 # =============================================================================
 module purge
 module load mamba/latest
+# Conda environment to activate. Defaults to the prebuilt genai25.09 env.
+# If Sol provisions a different env, override without editing this file:
+#   export ARXIVLENS_ENV=/path/to/your/env  (then sbatch as normal)
+CONDA_ENV="${ARXIVLENS_ENV:-/packages/envs/genai25.09}"
 # shellcheck disable=SC1091
-source activate /packages/envs/genai25.09
+source activate "$CONDA_ENV"
 
+echo "[env] Conda   : $CONDA_ENV"
 echo "[env] Python : $(which python)"
 echo "[env] PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 
 # =============================================================================
 # 4. Path variables
 # =============================================================================
-REPO_DIR=/home/spate472/arxivlens
-SCRATCH=/scratch/spate472/mlrag
+REPO_DIR="$HOME/arxivlens"
+SCRATCH="/scratch/$USER/mlrag"
 
 # Two candidate pair sources:
 #   VAL_PAIRS_FILE — an explicit held-out split, if one was ever emitted.
@@ -231,8 +236,8 @@ else:
     # fail loudly here too so a misconfigured env never yields empty metrics.
     print(
         "[eval] ERROR: no eval data — neither VAL_PAIRS_FILE nor PAIRS_FILE "
-        "exists. Expected val_pairs.jsonl or pairs.jsonl at "
-        "/scratch/spate472/mlrag/corpus/. Build them with scripts/build_pairs.py.",
+        f"exists. Expected {val_pairs} or {train_pairs}. "
+        "Build them with scripts/build_pairs.py.",
         file=sys.stderr,
     )
     sys.exit(1)
