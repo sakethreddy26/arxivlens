@@ -1,0 +1,9 @@
+# Normalize line endings: repo stores LF; Windows checkouts may use CRLF locally,
+# but files executed on the Sol Linux cluster must be LF.
+* text=auto
+
+# Files that run on Linux/Sol must always be LF, never CRLF.
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
