@@ -103,8 +103,8 @@ source activate "$CONDA_ENV"
 
 echo "[env] Conda   : $CONDA_ENV"
 echo "[env] Python : $(which python)"
-echo "[env] PyTorch: $(python -c 'import torch; print(torch.__version__)')"
-echo "[env] CUDA   : $(python -c 'import torch; print(torch.version.cuda)')"
+echo "[env] PyTorch: $(python3 -c 'import torch; print(torch.__version__)')"
+echo "[env] CUDA   : $(python3 -c 'import torch; print(torch.version.cuda)')"
 
 # =============================================================================
 # 4. Path variables — edit these if you relocate the data or repo
@@ -121,6 +121,11 @@ CONFIG=$REPO_DIR/configs/reranker.yaml     # hyperparameter config
 # 5. Change into the repo so Python relative imports resolve correctly
 # =============================================================================
 cd "$REPO_DIR"
+
+# The arxivlens package lives under src/ (src-layout) and is NOT pip-installed,
+# so put src/ on PYTHONPATH. accelerate launch's worker processes inherit this,
+# which is what makes `-m arxivlens.train.train_reranker` resolve.
+export PYTHONPATH="$REPO_DIR/src:${PYTHONPATH:-}"
 
 # =============================================================================
 # 6. Create output directories if they don't already exist

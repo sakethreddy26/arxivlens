@@ -77,7 +77,7 @@ source activate "$CONDA_ENV"
 
 echo "[env] Conda   : $CONDA_ENV"
 echo "[env] Python : $(which python)"
-echo "[env] PyTorch: $(python -c 'import torch; print(torch.__version__)')"
+echo "[env] PyTorch: $(python3 -c 'import torch; print(torch.__version__)')"
 
 # =============================================================================
 # 4. Path variables
@@ -114,6 +114,11 @@ export CHECKPOINT_DIR
 # =============================================================================
 cd "$REPO_DIR"
 
+# The arxivlens package lives under src/ (src-layout) and is NOT pip-installed,
+# so put src/ on PYTHONPATH. accelerate launch's worker processes inherit this,
+# which is what makes `-m arxivlens.train.train_reranker` resolve.
+export PYTHONPATH="$REPO_DIR/src:${PYTHONPATH:-}"
+
 # =============================================================================
 # 6. Find the latest checkpoint
 #    Checkpoints are named checkpoint_epoch{04d}_step{06d}.pt.
@@ -143,7 +148,7 @@ export LATEST_CKPT
 # =============================================================================
 echo "[eval] Starting evaluation at $(date)"
 
-python - <<'PYEOF'
+python3 - <<'PYEOF'
 import os
 import sys
 import json
