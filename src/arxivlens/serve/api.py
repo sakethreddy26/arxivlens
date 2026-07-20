@@ -90,17 +90,39 @@ def get_pipeline() -> Any:
     tokenizer_name = os.environ.get("TOKENIZER", "bert-base-uncased")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-    # Load a reranker config matching configs/reranker.yaml defaults.
-    config = TransformerConfig(
-        vocab_size=30522, d_model=256, n_heads=8, n_layers=4, d_ff=1024
-    )
-    reranker = CrossEncoderReranker(config, tokenizer=tokenizer)
-
+    # Build the reranker architecture. When a checkpoint is supplied, the config
+    # stored *inside* the checkpoint is authoritative (it is the arch the weights
+    # were trained with) — mirrors slurm/eval_reranker.sh so shapes always match.
     checkpoint = os.environ.get("CHECKPOINT")
     if checkpoint:
         state = torch.load(checkpoint, map_location="cpu")
+        cfg = state["config"]
+        m = cfg["model"]
+        config = TransformerConfig(
+            vocab_size=m["vocab_size"],
+            d_model=m["d_model"],
+            n_heads=m["n_heads"],
+            n_layers=m["n_layers"],
+            d_ff=m["d_ff"],
+            max_len=m["max_len"],
+            dropout=m.get("dropout", 0.1),
+        )
+        reranker = CrossEncoderReranker(config, tokenizer=tokenizer)
         reranker.load_state_dict(state["model_state_dict"])
         reranker.eval()
+    else:
+        # Dev / random-weights mode (no CHECKPOINT). These values mirror the
+        # current configs/reranker.yaml; a real CHECKPOINT overrides them with
+        # the arch stored in the checkpoint above.
+        config = TransformerConfig(
+            vocab_size=30522,
+            d_model=512,
+            n_heads=8,
+            n_layers=6,
+            d_ff=2048,
+            max_len=512,
+        )
+        reranker = CrossEncoderReranker(config, tokenizer=tokenizer)
 
     retrieve_k = int(os.environ.get("RETRIEVE_K", "50"))
     return RetrieveReranker(retriever=retriever, reranker=reranker, retrieve_k=retrieve_k)
