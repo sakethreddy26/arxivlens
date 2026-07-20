@@ -10,6 +10,7 @@ import math
 import pytest
 
 from arxivlens.train.eval import (
+    build_retrieval_eval_queries,
     dcg_at_k,
     evaluate_rankings,
     mrr,
@@ -197,5 +198,209 @@ def test_evaluate_rankings_skips_empty_queries():
 
 def test_evaluate_rankings_all_empty_is_zero():
     out = evaluate_rankings([([], []), ([], [])])
+    for value in out.values():
+        assert value == pytest.approx(0.0, abs=TOL)
+
+
+# --------------------------------------------------------------------------
+# build_retrieval_eval_queries — retrieve-then-rerank candidate assembly
+# --------------------------------------------------------------------------
+class _FakeRetriever:
+    """Returns a fixed candidate list per query id (keyed by the query title).
+
+    Each candidate is a dict shaped like FaissRetriever.retrieve() output:
+    ``{"paper_id", "title", "abstract"}``. Retrieval order (list order) is the
+    dense-similarity order; the reranker score decides the final ranking.
+    """
+
+    def __init__(self, by_query: dict[str, list[dict]]):
+        self._by_query = by_query
+        self.calls: list[tuple[str, int]] = []
+
+    def retrieve(self, query: str, k: int) -> list[dict]:
+        self.calls.append((query, k))
+        return list(self._by_query.get(query, []))[:k]
+
+
+class _FakeReranker:
+    """Scores passages by looking each up in a per-query score table.
+
+    Scores are keyed by candidate title so a test can place the gold paper at
+    an arbitrary rank by choosing its score. Records the (query, passages) it
+    was called with so tests can assert passage construction.
+    """
+
+    def __init__(self, score_by_title: dict[str, float]):
+        self._score_by_title = score_by_title
+        self.seen_passages: list[list[str]] = []
+        self.seen_queries: list[str] = []
+
+    def score(self, query: str, passages):
+        self.seen_queries.append(query)
+        self.seen_passages.append(list(passages))
+        # Passage text is "{title} {abstract}"; the candidate title is the first
+        # whitespace-delimited token (titles here are single tokens). Exact-match
+        # on that token so "neg1" never collides with "neg10". 0.0 if unmapped.
+        out = []
+        for p in passages:
+            head = p.split(" ", 1)[0]
+            out.append(self._score_by_title.get(head, 0.0))
+        return out
+
+
+def _candidate(paper_id: str, title: str, abstract: str = "abs") -> dict:
+    return {"paper_id": paper_id, "title": title, "abstract": abstract}
+
+
+def test_build_retrieval_eval_gold_at_rank_one():
+    # 50 candidates; gold paper "P0" is retrieved and the reranker gives it the
+    # top score -> recall@1/@5/@10 == 1.0, MRR == 1.0.
+    cands = [_candidate("P0", "gold")] + [
+        _candidate(f"N{i}", f"neg{i}") for i in range(49)
+    ]
+    retriever = _FakeRetriever({"gold-query": cands})
+    # Gold gets the highest score; every negative gets a strictly lower one.
+    scores = {"gold": 10.0, **{f"neg{i}": float(-i) for i in range(49)}}
+    reranker = _FakeReranker(scores)
+
+    records = [{"id": "P0", "title": "gold-query", "abstract": "whatever"}]
+    queries = build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+
+    assert len(queries) == 1
+    q_scores, q_labels = queries[0]
+    assert len(q_scores) == 50 and len(q_labels) == 50
+    assert sum(q_labels) == 1.0  # exactly one positive
+    assert q_labels[0] == 1.0  # gold is candidate 0
+
+    out = evaluate_rankings(queries)
+    assert out["recall@1"] == pytest.approx(1.0, abs=TOL)
+    assert out["recall@5"] == pytest.approx(1.0, abs=TOL)
+    assert out["recall@10"] == pytest.approx(1.0, abs=TOL)
+    assert out["mrr"] == pytest.approx(1.0, abs=TOL)
+
+
+def test_build_retrieval_eval_gold_at_rank_seven():
+    # Gold retrieved but reranked to rank 7 (six negatives score higher).
+    #   recall@1 = 0, recall@5 = 0, recall@10 = 1, MRR = 1/7.
+    cands = [_candidate("P0", "gold")] + [
+        _candidate(f"N{i}", f"neg{i}") for i in range(49)
+    ]
+    retriever = _FakeRetriever({"gold-query": cands})
+    # Six negatives beat gold (score 5.0); gold at 4.0; rest below.
+    scores = {"gold": 4.0}
+    for i in range(6):
+        scores[f"neg{i}"] = 5.0 + i  # strictly above gold
+    for i in range(6, 49):
+        scores[f"neg{i}"] = -1.0
+    reranker = _FakeReranker(scores)
+
+    records = [{"id": "P0", "title": "gold-query", "abstract": "x"}]
+    queries = build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+
+    out = evaluate_rankings(queries)
+    assert out["recall@1"] == pytest.approx(0.0, abs=TOL)
+    assert out["recall@5"] == pytest.approx(0.0, abs=TOL)
+    assert out["recall@10"] == pytest.approx(1.0, abs=TOL)
+    assert out["mrr"] == pytest.approx(1.0 / 7.0, abs=TOL)
+
+
+def test_build_retrieval_eval_gold_missing_is_all_zero_and_counted():
+    # Gold "P0" is NOT among the 50 retrieved candidates -> all-zero labels.
+    # The tuple is still emitted (non-empty ranking) and scored as 0.0.
+    cands = [_candidate(f"N{i}", f"neg{i}") for i in range(50)]
+    retriever = _FakeRetriever({"gold-query": cands})
+    reranker = _FakeReranker({f"neg{i}": float(-i) for i in range(50)})
+
+    records = [{"id": "P0", "title": "gold-query", "abstract": "x"}]
+    queries = build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+
+    assert len(queries) == 1
+    q_scores, q_labels = queries[0]
+    assert len(q_scores) == 50  # non-empty ranking -> included in macro-average
+    assert sum(q_labels) == 0.0  # all-zero labels: pipeline missed the gold
+
+    out = evaluate_rankings(queries)
+    assert out["recall@1"] == pytest.approx(0.0, abs=TOL)
+    assert out["recall@10"] == pytest.approx(0.0, abs=TOL)
+    assert out["mrr"] == pytest.approx(0.0, abs=TOL)
+
+
+def test_build_retrieval_eval_macro_average_mixed_queries():
+    # Query A: gold at rank 1 (MRR 1.0). Query B: gold missing (MRR 0.0).
+    #   macro MRR = mean(1.0, 0.0) = 0.5; recall@10 = mean(1.0, 0.0) = 0.5.
+    cands_a = [_candidate("A0", "agold")] + [
+        _candidate(f"AN{i}", f"aneg{i}") for i in range(49)
+    ]
+    cands_b = [_candidate(f"BN{i}", f"bneg{i}") for i in range(50)]  # gold B0 absent
+    retriever = _FakeRetriever({"a-query": cands_a, "b-query": cands_b})
+    scores = {"agold": 10.0}
+    scores.update({f"aneg{i}": float(-i) for i in range(49)})
+    scores.update({f"bneg{i}": float(-i) for i in range(50)})
+    reranker = _FakeReranker(scores)
+
+    records = [
+        {"id": "A0", "title": "a-query", "abstract": "x"},
+        {"id": "B0", "title": "b-query", "abstract": "y"},
+    ]
+    queries = build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+    assert len(queries) == 2
+
+    out = evaluate_rankings(queries)
+    assert out["mrr"] == pytest.approx(0.5, abs=TOL)
+    assert out["recall@1"] == pytest.approx(0.5, abs=TOL)
+    assert out["recall@10"] == pytest.approx(0.5, abs=TOL)
+
+
+def test_build_retrieval_eval_passages_use_candidate_text_not_query():
+    # Passage must be built from each candidate's own title/abstract.
+    cands = [
+        _candidate("P0", "gold", abstract="gold-abs"),
+        _candidate("N0", "neg0", abstract="neg-abs"),
+    ]
+    retriever = _FakeRetriever({"gold-query": cands})
+    reranker = _FakeReranker({"gold": 1.0, "neg0": 0.0})
+    records = [{"id": "P0", "title": "gold-query", "abstract": "query-abs"}]
+
+    build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+
+    passages = reranker.seen_passages[0]
+    assert passages == ["gold gold-abs", "neg0 neg-abs"]
+    # The query's own title/abstract must NOT leak into the passages.
+    assert all("gold-query" not in p and "query-abs" not in p for p in passages)
+    assert reranker.seen_queries[0] == "gold-query"  # query text is the title
+
+
+def test_build_retrieval_eval_normalizes_ids():
+    # Retrieved paper_id has surrounding whitespace; record id is clean.
+    cands = [_candidate("  P0  ", "gold")]
+    retriever = _FakeRetriever({"gold-query": cands})
+    reranker = _FakeReranker({"gold": 1.0})
+    records = [{"id": "P0", "title": "gold-query", "abstract": "x"}]
+
+    queries = build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+    _scores, labels = queries[0]
+    assert labels == [1.0]
+
+
+def test_build_retrieval_eval_positional_index_id_raises():
+    # A record id that is a bare positional index means the real id was lost.
+    retriever = _FakeRetriever({"gold-query": [_candidate("P0", "gold")]})
+    reranker = _FakeReranker({"gold": 1.0})
+    records = [{"id": "7", "title": "gold-query", "abstract": "x"}]
+
+    with pytest.raises(ValueError):
+        build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+
+
+def test_build_retrieval_eval_empty_retrieval_yields_empty_ranking():
+    # Retriever returns nothing -> empty ranking, dropped by evaluate_rankings.
+    retriever = _FakeRetriever({})  # no candidates for any query
+    reranker = _FakeReranker({})
+    records = [{"id": "P0", "title": "gold-query", "abstract": "x"}]
+
+    queries = build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+    assert queries == [([], [])]
+    # A single all-empty query -> all metrics 0.0 (n_queries == 0 path).
+    out = evaluate_rankings(queries)
     for value in out.values():
         assert value == pytest.approx(0.0, abs=TOL)

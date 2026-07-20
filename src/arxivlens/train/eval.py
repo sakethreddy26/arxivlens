@@ -52,7 +52,7 @@ across all queries. Queries with no candidates are skipped.
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -62,6 +62,7 @@ __all__ = [
     "mrr",
     "recall_at_k",
     "evaluate_rankings",
+    "build_retrieval_eval_queries",
 ]
 
 ArrayLike = Sequence[float] | np.ndarray
@@ -255,3 +256,139 @@ def evaluate_rankings(
     if n_queries == 0:
         return {key: 0.0 for key in keys}
     return {key: sums[key] / n_queries for key in keys}
+
+
+# --------------------------------------------------------------------------- #
+# Retrieve-then-rerank candidate assembly (dependency-injected, faiss-free)    #
+# --------------------------------------------------------------------------- #
+
+
+def _normalize_id(paper_id: Any) -> str:
+    """Canonicalize a paper id for equality comparison.
+
+    Retrieval meta (``FaissRetriever``) sources the id from ``paper_id`` /
+    ``id`` / ``arxiv_id`` while the held-out records carry ``id``; both are
+    coerced to ``str`` here and stripped of surrounding whitespace so the two
+    sides compare on a level field.
+    """
+    return str(paper_id).strip()
+
+
+def _looks_like_positional_index(value: str) -> bool:
+    """True if ``value`` looks like a bare positional index, not a real id.
+
+    ``pairs.py`` falls back to ``str(positional_index)`` when a record has no
+    ``id`` field, so a query id of e.g. ``"7"`` means the reconstruction lost
+    the real arXiv id and label matching against ``paper_id`` would be
+    meaningless. Real arXiv ids always contain a non-digit (``.`` or ``/``).
+    """
+    return value.isdigit()
+
+
+def build_retrieval_eval_queries(
+    eval_records: Iterable[Mapping[str, Any]],
+    retriever: Any,
+    reranker: Any,
+    num_candidates: int,
+) -> list[tuple[list[float], list[float]]]:
+    """Assemble ``(scores, labels)`` per query via real retrieve-then-rerank.
+
+    This is the non-degenerate replacement for scoring a query against only its
+    own ~5 synthetic pairs (which saturates recall@k at 1.0). For each held-out
+    record it retrieves ``num_candidates`` real candidates from the FAISS
+    corpus, reranks them with the cross-encoder, and labels the query's own
+    paper as the single positive — so the metrics measure whether the reranker
+    can float the gold paper to the top of a realistic ~50-candidate list.
+
+    Dependency injection (faiss-free): ``retriever`` and ``reranker`` are passed
+    in, so this module never imports ``faiss``/``torch`` at top level and stays
+    importable in CI. In production pass a ``FaissRetriever`` and a
+    ``CrossEncoderReranker``; tests pass small fakes.
+
+    Per record the flow is:
+
+    * ``candidates = retriever.retrieve(query=title, k=num_candidates)`` — a
+      list of dicts, each with at least ``paper_id``, ``title``, ``abstract``,
+      in decreasing similarity order.
+    * ``passages = ["{title} {abstract}".strip()]`` built from **each
+      candidate's own** title/abstract (matching ``retrieve/pipeline.py``), NOT
+      the query's.
+    * ``scores = reranker.score(query=title, passages=passages)`` — a length-N
+      array-like (a torch tensor in production) of relevance logits.
+    * ``labels[j] = 1.0`` iff the candidate's normalized ``paper_id`` equals the
+      record's normalized ``id``, else ``0.0``.
+
+    Labeling scheme: exactly one positive per query — the query's own paper.
+    Every other retrieved candidate is a negative (label 0), consistent with the
+    synthetic single-relevant protocol used elsewhere.
+
+    Missed-retrieval contract: if the gold paper is NOT among the retrieved
+    candidates, the tuple is still emitted with an **all-zero** label vector.
+    That is a non-empty ranking, so ``evaluate_rankings`` scores it as ``0.0``
+    for every metric and includes it in the macro-average — the correct
+    retrieve-then-rerank penalty (the pipeline genuinely failed to surface the
+    answer). Only queries where the retriever returns *no* candidates at all are
+    skipped (they contribute an empty ranking that ``evaluate_rankings`` drops).
+
+    Args:
+        eval_records: held-out records, each a mapping with ``id``, ``title``,
+            ``abstract``. Reconstructed from ``pairs.jsonl`` upstream
+            (query_id -> id, query -> title, the label-1 passage -> abstract).
+        retriever: object with ``retrieve(query: str, k: int) -> list[dict]``.
+        reranker: object with ``score(query: str, passages: Sequence[str])``
+            returning a length-``len(passages)`` array-like of scores.
+        num_candidates: candidates to retrieve per query (the eval breadth).
+
+    Returns:
+        One ``(scores, labels)`` tuple per query, both plain ``list[float]`` of
+        equal length, ready to hand to :func:`evaluate_rankings`.
+
+    Raises:
+        ValueError: if a record's ``id`` looks like a bare positional index
+            rather than a real paper id (its real id was lost during
+            reconstruction, making label matching meaningless).
+    """
+    out: list[tuple[list[float], list[float]]] = []
+
+    for record in eval_records:
+        title = "" if record.get("title") is None else str(record["title"])
+        abstract = "" if record.get("abstract") is None else str(record["abstract"])
+        gold_id = _normalize_id(record.get("id", ""))
+
+        if not gold_id or _looks_like_positional_index(gold_id):
+            raise ValueError(
+                f"eval record id {gold_id!r} looks like a positional index, not "
+                "a real paper id; label matching against retrieved paper_id "
+                "would be meaningless. Ensure pairs reconstruction preserved the "
+                "record's real id."
+            )
+
+        candidates = retriever.retrieve(query=title, k=num_candidates)
+        if not candidates:
+            # Empty ranking; evaluate_rankings skips it. Nothing to score.
+            out.append(([], []))
+            continue
+
+        # Passage text mirrors retrieve/pipeline.py: each candidate's OWN
+        # title+abstract, not the query's. This "{title} {abstract}" format
+        # INTENTIONALLY differs from training (which uses abstract-only passages):
+        # eval mirrors retrieve/pipeline.py / production so we "evaluate as
+        # deployed". Do NOT "fix" this to abstract-only — that would break
+        # parity with the production pipeline.
+        passages = [
+            f"{c.get('title', '')} {c.get('abstract', '')}".strip() for c in candidates
+        ]
+        scores = reranker.score(query=title, passages=passages)
+
+        # Coerce whatever the reranker returned (torch tensor, ndarray, list)
+        # into a flat list of floats without importing torch here.
+        scores_list = [float(s) for s in np.asarray(scores, dtype=np.float64).ravel()]
+
+        labels = [
+            1.0 if _normalize_id(c.get("paper_id", "")) == gold_id else 0.0
+            for c in candidates
+        ]
+
+        out.append((scores_list, labels))
+
+    return out

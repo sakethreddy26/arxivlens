@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import math
 import os
 import random
@@ -70,7 +71,7 @@ from transformers import AutoTokenizer
 from arxivlens.data.dataset import PairDataset, collate_fn, group_split_indices
 from arxivlens.model.reranker import CrossEncoderReranker
 from arxivlens.model.transformer import TransformerConfig
-from arxivlens.train.eval import evaluate_rankings
+from arxivlens.train.eval import build_retrieval_eval_queries, evaluate_rankings
 
 
 def _mlflow_safe(name: str) -> str:
@@ -272,6 +273,146 @@ def _run_eval(
 
 
 # ---------------------------------------------------------------------------
+# Retrieve-then-rerank final eval (FAISS)
+# ---------------------------------------------------------------------------
+
+def _raw_val_records(val_dataset: Any) -> list[dict[str, Any]]:
+    """Return the raw parsed pairs backing ``val_dataset``, in val order.
+
+    Handles both val-dataset shapes the trainer produces:
+
+    * a :class:`~torch.utils.data.Subset` over the full ``PairDataset`` (the
+      seeded group-wise auto-split), whose ``.indices`` select the held-out
+      rows of ``subset.dataset._lines``;
+    * a plain ``PairDataset`` loaded from an explicit ``val_pairs_file``.
+
+    Parses the stored JSON lines directly (no tokenization) so this is cheap
+    and independent of ``__getitem__``.
+    """
+    if isinstance(val_dataset, Subset):
+        base = val_dataset.dataset
+        indices = list(val_dataset.indices)
+    else:
+        base = val_dataset
+        indices = range(len(getattr(base, "_lines", [])))
+
+    lines = getattr(base, "_lines", None)
+    if lines is None:
+        return []
+    return [json.loads(lines[i]) for i in indices]
+
+
+def _reconstruct_eval_records(val_dataset: Any) -> list[dict[str, Any]]:
+    """Rebuild one held-out eval record per query from the val pairs.
+
+    Each query_id group in ``pairs.jsonl`` carries exactly one label-1 pair
+    (the paper's own title/abstract). We reconstruct, per group, a record with:
+
+    * ``id``       = the pair's ``query_id`` (the paper's real id, per
+      ``build_pairs``; a bare positional-index fallback is rejected downstream
+      by ``build_retrieval_eval_queries``);
+    * ``title``    = the pair's ``query`` (the paper title used as the query);
+    * ``abstract`` = the label-1 pair's ``passage`` (the paper's own abstract).
+
+    Only groups whose positive (label 1) pair is present in the held-out split
+    yield a record — a group cannot be scored as retrieve-then-rerank without
+    its gold abstract. Preserves first-seen group order for reproducibility.
+    Does NOT read papers.jsonl (design decision O2).
+    """
+    records: dict[str, dict[str, Any]] = {}
+    for pair in _raw_val_records(val_dataset):
+        if int(pair.get("label", 0)) != 1:
+            continue
+        qid = str(pair.get("query_id", ""))
+        if not qid or qid in records:
+            continue
+        records[qid] = {
+            "id": qid,
+            "title": "" if pair.get("query") is None else str(pair["query"]),
+            "abstract": "" if pair.get("passage") is None else str(pair["passage"]),
+        }
+    return list(records.values())
+
+
+def _try_build_faiss_retriever(cfg: _Namespace, accelerator: Accelerator) -> Any | None:
+    """Build a ``FaissRetriever`` for final eval, or return ``None`` to fall back.
+
+    Graceful degradation (design decision O4): the index/meta files are absent
+    in CI, CPU smoke tests, and most local runs, and ``faiss`` /
+    ``sentence-transformers`` may not be installed at all. Any of those cases
+    must NOT break training — we log the reason and return ``None`` so the
+    caller uses the existing grouped-by-query_id eval instead.
+
+    All heavy imports happen lazily inside ``FaissRetriever.__init__``; this
+    function only touches the filesystem and catches everything.
+    """
+    index_path = Path(str(getattr(cfg.training, "eval_index_path", "index/index.faiss")))
+    meta_path = Path(str(getattr(cfg.training, "eval_meta_path", "index/meta.jsonl")))
+
+    if not index_path.exists() or not meta_path.exists():
+        accelerator.print(
+            f"[final eval] FAISS index/meta not found "
+            f"(index={index_path}, meta={meta_path}); "
+            "falling back to grouped-by-query_id eval."
+        )
+        return None
+
+    try:
+        # Lazy import so a missing faiss/sentence-transformers install never
+        # breaks module import or CPU-only runs.
+        from arxivlens.retrieve.index import FaissRetriever  # noqa: PLC0415
+
+        retriever = FaissRetriever(index_path, meta_path)
+    except Exception as exc:  # noqa: BLE001 — any failure => graceful fallback
+        accelerator.print(
+            f"[final eval] could not build FaissRetriever ({type(exc).__name__}: {exc}); "
+            "falling back to grouped-by-query_id eval."
+        )
+        return None
+
+    accelerator.print(
+        f"[final eval] using FAISS retrieve-then-rerank eval "
+        f"(index={index_path}, meta={meta_path})."
+    )
+    return retriever
+
+
+def _run_faiss_eval(
+    model: nn.Module,
+    retriever: Any,
+    val_dataset: Any,
+    accelerator: Accelerator,
+    num_candidates: int,
+) -> dict[str, float]:
+    """Final retrieve-then-rerank eval over the held-out queries.
+
+    Reconstructs eval records from the val pairs, retrieves ``num_candidates``
+    real candidates per query, reranks them with the (unwrapped) cross-encoder,
+    and aggregates ranking metrics. Runs on the calling process only (the
+    caller guards this to rank 0); the reranker's ``score`` handles device
+    placement via the model's own parameters.
+    """
+    eval_records = _reconstruct_eval_records(val_dataset)
+    accelerator.print(
+        f"[final eval] reconstructed {len(eval_records)} held-out query records "
+        f"for FAISS eval (num_candidates={num_candidates})."
+    )
+    # Unwrap so we call the plain CrossEncoderReranker.score (DDP wrappers do
+    # not expose it), matching how checkpoints store the unwrapped module.
+    reranker = accelerator.unwrap_model(model)
+    was_training = reranker.training
+    reranker.eval()
+    try:
+        queries = build_retrieval_eval_queries(
+            eval_records, retriever, reranker, num_candidates
+        )
+    finally:
+        if was_training:
+            reranker.train()
+    return evaluate_rankings(queries)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -396,6 +537,10 @@ def run_training(
     # LR schedule shape after warmup: "constant" (default, unchanged numerics)
     # or "cosine" (decay to 0 over the full run). getattr keeps old configs OK.
     lr_schedule: str = str(getattr(cfg.training, "lr_schedule", "constant"))
+    # Retrieve-then-rerank final-eval breadth. getattr fallback keeps old
+    # configs (and the CPU smoke test's config) working; a YAML null would
+    # slip past a plain getattr, so coerce with an explicit default guard.
+    eval_num_candidates: int = int(getattr(cfg.training, "eval_num_candidates", 50) or 50)
 
     # ------------------------------------------------------------------
     # 2. Reproducibility seeds
@@ -765,8 +910,32 @@ def run_training(
 
         # Final eval over the full val set — main process only (see the
         # periodic-eval rationale above; the val set is small).
+        #
+        # Design decision O1: run the FAISS retrieve-then-rerank eval ONLY here
+        # at FINAL eval, never on the periodic monitoring steps above (which keep
+        # the cheap grouped-by-query_id eval). Design decision O4: if no index is
+        # available (CI/CPU/local), fall back to the same grouped eval so nothing
+        # breaks — final_metrics stays identical to the previous behaviour.
         if val_loader is not None and accelerator.is_main_process:
-            final_metrics = _run_eval(model, val_loader, accelerator)
+            retriever = _try_build_faiss_retriever(cfg, accelerator)
+            if retriever is not None:
+                try:
+                    final_metrics = _run_faiss_eval(
+                        model,
+                        retriever,
+                        val_dataset,
+                        accelerator,
+                        eval_num_candidates,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never fail the run on eval
+                    accelerator.print(
+                        f"[final eval] FAISS eval failed "
+                        f"({type(exc).__name__}: {exc}); "
+                        "falling back to grouped-by-query_id eval."
+                    )
+                    final_metrics = _run_eval(model, val_loader, accelerator)
+            else:
+                final_metrics = _run_eval(model, val_loader, accelerator)
             mlflow.log_metrics(
                 {
                     _mlflow_safe(f"val/final_{k}"): v

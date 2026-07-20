@@ -24,3 +24,6 @@ training:
   val_fraction: 0.1                        # fraction of pairs to hold out if no val_pairs_file given
   seed: 42                                 # seeds torch, numpy, and random for reproducibility
   tokenizer_name: "bert-base-uncased"      # HuggingFace tokenizer; loaded via AutoTokenizer.from_pretrained
+  eval_num_candidates: 50                   # candidates retrieved per query for retrieve-then-rerank eval
+  eval_index_path: "index/index.faiss"      # FAISS index for eval retrieval
+  eval_meta_path: "index/meta.jsonl"        # meta sidecar for eval retrieval
