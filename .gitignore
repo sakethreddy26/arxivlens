@@ -22,6 +22,7 @@ mlruns/
 # Internal planning docs — kept locally, not published
 BUILD_PLAN.md
 PROGRESS.md
+ml_audit_report.md
 
 # Tooling / assistant config — local only
 .claude/
