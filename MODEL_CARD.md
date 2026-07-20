@@ -16,15 +16,15 @@
 | Class | `CrossEncoderReranker` (`src/arxivlens/model/reranker.py`) |
 | Encoder body | `TransformerEncoder` (`src/arxivlens/model/transformer.py`) |
 | Vocabulary | WordPiece, bert-base-uncased — 30,522 tokens |
-| Input format | `[CLS] query [SEP] passage [SEP]`, max 256 tokens |
-| Layers | 4 pre-norm `EncoderLayer` blocks |
-| Attention heads | 8 (d_head = 32) |
-| d_model | 256 |
-| d_ff | 1,024 |
+| Input format | `[CLS] query [SEP] passage [SEP]`, max 256 tokens (`max_input_length`) |
+| Layers | 6 pre-norm `EncoderLayer` blocks |
+| Attention heads | 8 (d_head = 64) |
+| d_model | 512 |
+| d_ff | 2,048 |
 | Dropout | 0.1 (attention weights, FFN activations, residual branches) |
 | Positional encoding | Sinusoidal, non-trainable (max_len=512) |
-| Output head | `Linear(256, 1)` on `[CLS]` hidden state → relevance logit |
-| Parameter count | Approximately 9–10 M (exact count printed at training launch) |
+| Output head | `Linear(512, 1)` on `[CLS]` hidden state → relevance logit |
+| Parameter count | ~34.5 M (derived analytically from `configs/reranker.yaml`; verify via `sum(p.numel() for p in model.parameters())`) |
 
 The encoder is written from scratch in pure PyTorch. No pretrained transformer weights are used — only the WordPiece tokenizer is borrowed from `bert-base-uncased` via `AutoTokenizer`.
 
@@ -38,7 +38,7 @@ from arxivlens.model.reranker import CrossEncoderReranker
 from arxivlens.model.transformer import TransformerConfig
 
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-config = TransformerConfig(vocab_size=30522, d_model=256, n_heads=8, n_layers=4, d_ff=1024)
+config = TransformerConfig(vocab_size=30522, d_model=512, n_heads=8, n_layers=6, d_ff=2048, max_len=512)
 model = CrossEncoderReranker(config, tokenizer=tokenizer)
 
 # Score one query against multiple passages
@@ -54,6 +54,8 @@ ranked = sorted(enumerate(passages), key=lambda x: scores[x[0]].item(), reverse=
 ## 2. Intended Use
 
 **Primary use case:** Stage-2 reranker in the ArXivLens retrieve-then-rerank pipeline. A FAISS bi-encoder retrieves up to 50 candidate papers; this model reranks them by scoring each `(query, abstract)` pair with a full forward pass.
+
+When served via `src/arxivlens/serve/api.py`, the reranker's architecture is read from the config stored inside the checkpoint (not a hardcoded arch), so any trained checkpoint loads without a shape mismatch.
 
 **Intended users:** Researchers and students querying the ArXiv ML corpus through the ArXivLens API or notebooks.
 
@@ -103,9 +105,10 @@ Default ratio: 1 positive : 2 hard negatives : 2 easy negatives per query (`n_ha
 | Loss | `BCEWithLogitsLoss` (binary cross-entropy per pair) |
 | Optimizer | AdamW |
 | Learning rate | 2e-4 (base) |
-| LR schedule | Linear warmup for 200 steps, then constant |
-| Batch size | 32 |
-| Epochs | 5 |
+| LR schedule | Linear warmup for 200 steps, then constant (`lr_schedule: constant`) |
+| Gradient clipping | Max global grad norm 1.0 |
+| Batch size | 128 |
+| Epochs | 8 |
 | Seed | 42 |
 
 ### Checkpointing
@@ -150,16 +153,14 @@ Metrics are computed by `src/arxivlens/train/eval.py` (entry point: `evaluate_ra
 | Recall@5 | Fraction of queries where the relevant paper is in the top 5 |
 | Recall@10 | Fraction of queries where the relevant paper is in the top 10 |
 
-**Results (placeholder — to be filled after training):**
+**Results.** Head-to-head on the same held-out queries, 50 candidates per query:
 
-| Metric | Dev set |
-|---|---|
-| nDCG@5 | TBD |
-| nDCG@10 | TBD |
-| MRR | TBD |
-| Recall@1 | TBD |
-| Recall@5 | TBD |
-| Recall@10 | TBD |
+| Stage | nDCG@5 | nDCG@10 | MRR | Recall@1 | Recall@5 | Recall@10 |
+|---|---|---|---|---|---|---|
+| FAISS retrieval-only | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ |
+| + from-scratch reranker | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ |
+
+The numbers are produced by a single Sol eval job (`slurm/eval_reranker.sh`) and recorded with full provenance — checkpoint, SLURM job id, candidate count, metrics, and missed-gold count — in `results/eval_<JOBID>.json`.
 
 Note: All eval numbers reflect the synthetic label protocol described in Section 3. Because hard negatives may be genuinely relevant, these numbers underestimate real-world ranking quality.
 
@@ -175,7 +176,7 @@ curl -X POST http://localhost:8000/explain \
   -d '{"query": "graph neural networks", "paper_id": "2301.00001"}'
 ```
 
-The response includes `tokens`, `attention_weights` (shape: `n_layers × n_heads × seq_len × seq_len`), and the relevance `score`.
+The response includes `tokens`, `attention_weights` (shape: `query_tokens × passage_tokens`, averaged over layers and heads), and the relevance `score`.
 
 For interactive exploration, `notebooks/attention_demo.ipynb` renders a query-rows × passage-columns heatmap — the sub-block bounded by the first and second `[SEP]` tokens, excluding padding.
 
@@ -186,7 +187,7 @@ For interactive exploration, `notebooks/attention_demo.ipynb` renders a query-ro
 ## 7. Limitations
 
 - **Synthetic training data only.** No human relevance judgments were used. The positive/negative labeling is a proxy, not ground truth.
-- **Small model.** d_model=256 with 4 layers is significantly smaller than production rerankers (e.g., BERT-base at d_model=768, 12 layers). Ranking quality will likely fall below commercial alternatives.
+- **Small model.** d_model=512 with 6 layers (~34.5 M parameters) is smaller than production rerankers (e.g., BERT-base at d_model=768, 12 layers). Ranking quality will likely fall below commercial alternatives.
 - **Domain-specific.** Trained exclusively on ArXiv ML abstracts. Performance on other domains (e.g., biomedical, legal, code) is untested and not expected to transfer without fine-tuning.
 - **CPU inference is slow.** The Docker image runs CPU-only; scoring 50 candidates per query is feasible but not production-grade without a GPU.
 - **No bias or fairness evaluation.** The model has not been audited for differential ranking by author demographics, institutional affiliation, or writing style.

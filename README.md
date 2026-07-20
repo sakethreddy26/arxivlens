@@ -14,7 +14,7 @@ Query
   ▼
 ┌─────────────────────────────────┐
 │  Bi-Encoder (sentence-transformers)│
-│  Encode query → 768-d vector      │
+│  Encode query → 384-d vector      │
 └─────────────────┬───────────────┘
                   │  cosine search
                   ▼
@@ -28,8 +28,8 @@ Query
 ┌─────────────────────────────────────────────────────────┐
 │  Cross-Encoder Reranker  (from scratch)                  │
 │  [CLS] query [SEP] passage [SEP]                        │
-│  → TransformerEncoder (4 layers, 8 heads, d_model=256) │
-│  → [CLS] hidden → Linear(256,1) → relevance logit      │
+│  → TransformerEncoder (6 layers, 8 heads, d_model=512) │
+│  → [CLS] hidden → Linear(512,1) → relevance logit      │
 └────────────────────────────┬────────────────────────────┘
                              │  ranked results + attention weights
                              ▼
@@ -39,7 +39,7 @@ Query
 
 **Stage 1 — Dense retrieval.** `sentence-transformers/all-MiniLM-L6-v2` encodes every abstract offline into a 384-d vector stored in a FAISS flat-IP index. At query time the query is embedded with the same model and the top-K (default 50) nearest neighbours are returned in milliseconds — no cross-attention, pure dot-product similarity.
 
-**Stage 2 — Cross-encoder reranking.** Each of the K candidates is paired with the query as `[CLS] query [SEP] passage [SEP]` and fed through a from-scratch `TransformerEncoder` (4 layers, 8 heads, d_model=256, d_ff=1024). The `[CLS]` hidden state is projected to a scalar relevance logit; candidates are re-sorted by that logit. Because query and passage tokens attend to each other jointly, the reranker captures fine-grained term interactions the bi-encoder misses.
+**Stage 2 — Cross-encoder reranking.** Each of the K candidates is paired with the query as `[CLS] query [SEP] passage [SEP]` and fed through a from-scratch `TransformerEncoder` (6 layers, 8 heads, d_model=512, d_ff=2048, max_len=512, max_input_length=256). The `[CLS]` hidden state is projected to a scalar relevance logit; candidates are re-sorted by that logit. Because query and passage tokens attend to each other jointly, the reranker captures fine-grained term interactions the bi-encoder misses.
 
 **Stage 3 — Attention lens.** The same forward pass that scores a pair also returns per-layer, per-head attention weights. `POST /explain` slices the query-token × passage-token sub-block and averages over layers and heads to produce a 2-D heatmap. See `notebooks/attention_demo.ipynb` for an interactive version.
 
@@ -72,7 +72,7 @@ docker run -p 8000:8000 \
 # Then: curl http://localhost:8000/health
 ```
 
-`INDEX_PATH` and `META_PATH` are required; `CHECKPOINT` is optional (the service runs with an untrained reranker if omitted). Additional environment variables:
+`INDEX_PATH` and `META_PATH` are required; `CHECKPOINT` is optional (the service runs with an untrained reranker if omitted). When a `CHECKPOINT` is supplied, the served reranker's architecture is read from the config stored inside the checkpoint — not a hardcoded arch — so any trained checkpoint loads without shape mismatch. Additional environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
@@ -136,13 +136,14 @@ Returns `attention_weights` — a `query_tokens × passage_tokens` matrix averag
 
 ## Results
 
-| Model | nDCG@5 | nDCG@10 | MRR | Recall@10 |
-|---|---|---|---|---|
-| BM25 baseline | — | — | — | — |
-| Bi-encoder only | — | — | — | — |
-| + Cross-encoder rerank | — | — | — | — |
+Head-to-head on the same held-out queries, 50 candidates per query:
 
-Results to be filled in after Sol training run completes.
+| Stage | nDCG@5 | nDCG@10 | MRR | Recall@1 | Recall@5 | Recall@10 |
+|---|---|---|---|---|---|---|
+| FAISS retrieval-only | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ |
+| + from-scratch reranker | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ | _pending eval job_ |
+
+The numbers are produced by a single Sol eval job (`slurm/eval_reranker.sh`) and recorded with full provenance — checkpoint, SLURM job id, candidate count, metrics, and missed-gold count — in `results/eval_<JOBID>.json`.
 
 ---
 
@@ -168,7 +169,7 @@ Before anything else, the corpus and FAISS index must already exist on scratch:
     └── meta.jsonl             # paper id per FAISS row, in row order
 ```
 
-These are produced on Sol by `download_arxiv.py` (fetches abstracts) and `embed_corpus.py` (embeds + builds the FAISS index) — both run there, where faiss and the GPU embedder are available. Nothing downstream works until these files are in place.
+These are produced on Sol by two build steps run there, where faiss and the GPU embedder are available: fetching the ArXiv abstracts, then embedding them and building the FAISS flat-IP index. **Those two build scripts are not committed to this repo** — they live on Sol scratch and are an acknowledged reproducibility gap. A reviewer cloning the repo cannot regenerate the corpus or index from it; the steps below assume `corpus/papers.jsonl`, `index/index.faiss`, and `index/meta.jsonl` already exist on scratch. Nothing downstream works until these files are in place.
 
 ### 1. Clone + set up
 
@@ -284,7 +285,7 @@ ArXivLens/
 ## Limitations
 
 - The reranker is trained on synthetic pairs built from FAISS hard negatives. No human relevance labels have been collected yet, so ranking quality against real user queries is unverified.
-- The model is small (d_model=256, 4 layers) relative to production rerankers. Performance numbers will remain placeholder until the Sol training run completes.
+- The model is small (d_model=512, 6 layers, ~34.5 M parameters) relative to production rerankers. Performance numbers will remain placeholder until the Sol eval job completes.
 - Attention weights are an interpretability aid, not a causal explanation. Token salience measured by attention does not reliably predict counterfactual importance (Jain & Wallace 2019).
 - The Docker image uses CPU-only PyTorch. Serving latency at scale requires a GPU host; the cross-encoder scores each candidate with a separate forward pass (O(K) per query).
 
