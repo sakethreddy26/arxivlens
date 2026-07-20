@@ -241,7 +241,11 @@ from arxivlens.model.transformer import TransformerConfig
 from arxivlens.model.reranker import CrossEncoderReranker
 from arxivlens.data.dataset import PairDataset, group_split_indices
 from arxivlens.retrieve.index import FaissRetriever
-from arxivlens.train.eval import build_retrieval_eval_queries, evaluate_rankings
+from arxivlens.train.eval import (
+    build_retrieval_eval_queries,
+    evaluate_rankings,
+    rank_diagnostics,
+)
 from transformers import AutoTokenizer
 
 ckpt_path = os.environ["LATEST_CKPT"]
@@ -432,6 +436,12 @@ reranker_queries, retrieval_queries = build_retrieval_eval_queries(
 # head-to-head comparison (closes the G5 retrieval-only-baseline blocker).
 metrics = evaluate_rankings(reranker_queries)
 baseline_metrics = evaluate_rankings(retrieval_queries)
+diagnostics = rank_diagnostics(reranker_queries, retrieval_queries)
+for row, record in zip(diagnostics["per_query"], eval_records):
+    row["query_id"] = str(record.get("id", ""))
+    row["title"] = str(record.get("title", ""))
+diag_summary = diagnostics["summary"]
+hard_metrics = diagnostics["hard_metrics"]
 
 # Interpretability: a query whose gold paper never made it into the retrieved
 # candidate set has an all-zero label vector — no reranker can recover it, so it
@@ -445,6 +455,23 @@ print("=== ArXivLens Reranker Evaluation (retrieve-then-rerank) ===")
 print(f"{'metric':17s} {'retrieval-only':16s} {'+ reranker'}")
 for k in metrics:
     print(f"{k:17s} {baseline_metrics[k]:<16.4f} {metrics[k]:.4f}")
+print()
+print("=== Hard-only subset (FAISS gold rank > 1) ===")
+print(f"{'metric':17s} {'retrieval-only':16s} {'+ reranker'}")
+for k in hard_metrics["reranker"]:
+    print(
+        f"{k:17s} "
+        f"{hard_metrics['retrieval_only'][k]:<16.4f} "
+        f"{hard_metrics['reranker'][k]:.4f}"
+    )
+print()
+print("=== Rank movement diagnostics ===")
+print(f"Hard queries        : {diag_summary['n_hard_queries']}")
+print(f"Improved            : {diag_summary['improved']}")
+print(f"Same                : {diag_summary['same']}")
+print(f"Worsened            : {diag_summary['worsened']}")
+print(f"Mean rank delta     : {diag_summary['mean_rank_delta']:.4f}")
+print(f"Median rank delta   : {diag_summary['median_rank_delta']:.4f}")
 print()
 print(f"Checkpoint          : {ckpt_path}")
 print(f"Eval source         : {eval_source}")
@@ -487,6 +514,7 @@ report = {
         "reranker": metrics,
         "retrieval_only": baseline_metrics,
     },
+    "rank_diagnostics": diagnostics,
     "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }
 

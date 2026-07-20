@@ -16,6 +16,7 @@ from arxivlens.train.eval import (
     evaluate_rankings,
     mrr,
     ndcg_at_k,
+    rank_diagnostics,
     recall_at_k,
 )
 
@@ -201,6 +202,55 @@ def test_evaluate_rankings_all_empty_is_zero():
     out = evaluate_rankings([([], []), ([], [])])
     for value in out.values():
         assert value == pytest.approx(0.0, abs=TOL)
+
+
+def test_rank_diagnostics_counts_movements_and_hard_metrics():
+    retrieval_queries = [
+        ([2.0, 1.0], [1, 0]),  # FAISS rank 1; unchanged
+        ([3.0, 2.0, 1.0], [0, 0, 1]),  # FAISS rank 3; hard query
+        ([2.0, 1.0], [1, 0]),  # FAISS rank 1; reranker makes it worse
+        ([2.0, 1.0], [0, 0]),  # gold missed by retrieval
+    ]
+    reranker_queries = [
+        ([2.0, 1.0], [1, 0]),  # same
+        ([0.0, 0.0, 10.0], [0, 0, 1]),  # improved to rank 1
+        ([0.0, 1.0], [1, 0]),  # worsened to rank 2
+        ([2.0, 1.0], [0, 0]),  # still missed
+    ]
+
+    diagnostics = rank_diagnostics(reranker_queries, retrieval_queries)
+    summary = diagnostics["summary"]
+
+    assert summary["n_queries"] == 4
+    assert summary["n_nonempty"] == 4
+    assert summary["n_hard_queries"] == 1
+    assert summary["improved"] == 1
+    assert summary["same"] == 1
+    assert summary["worsened"] == 1
+    assert summary["n_gold_missed"] == 1
+    assert summary["mean_rank_delta"] == pytest.approx((0 + 2 - 1) / 3, abs=TOL)
+
+    hard = diagnostics["hard_metrics"]
+    assert hard["retrieval_only"]["mrr"] == pytest.approx(1.0 / 3.0, abs=TOL)
+    assert hard["retrieval_only"]["recall@1"] == pytest.approx(0.0, abs=TOL)
+    assert hard["reranker"]["mrr"] == pytest.approx(1.0, abs=TOL)
+    assert hard["reranker"]["recall@1"] == pytest.approx(1.0, abs=TOL)
+
+    rows = diagnostics["per_query"]
+    assert rows[1]["faiss_rank"] == 3
+    assert rows[1]["reranker_rank"] == 1
+    assert rows[1]["rank_delta"] == 2
+    assert rows[1]["outcome"] == "improved"
+    assert rows[1]["hard_query"] is True
+
+
+def test_rank_diagnostics_keeps_empty_queries_visible():
+    diagnostics = rank_diagnostics([([], [])], [([], [])])
+
+    assert diagnostics["summary"]["n_queries"] == 1
+    assert diagnostics["summary"]["n_nonempty"] == 0
+    assert diagnostics["summary"]["n_empty"] == 1
+    assert diagnostics["per_query"][0]["outcome"] == "empty"
 
 
 # --------------------------------------------------------------------------

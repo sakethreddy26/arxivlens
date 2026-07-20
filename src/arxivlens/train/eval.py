@@ -63,6 +63,7 @@ __all__ = [
     "recall_at_k",
     "evaluate_rankings",
     "build_retrieval_eval_queries",
+    "rank_diagnostics",
 ]
 
 ArrayLike = Sequence[float] | np.ndarray
@@ -209,6 +210,15 @@ def recall_at_k(scores: ArrayLike, labels: ArrayLike, k: int) -> float:
     return hits / total_relevant
 
 
+def _first_relevant_rank(scores: ArrayLike, labels: ArrayLike) -> int | None:
+    """Return the 1-based rank of the first relevant item, or ``None``."""
+    gains = _gains_in_predicted_order(scores, labels)
+    relevant = np.nonzero(gains >= 1.0)[0]
+    if relevant.size == 0:
+        return None
+    return int(relevant[0]) + 1
+
+
 # Metric cutoffs the README results table reports.
 _NDCG_KS = (5, 10)
 _RECALL_KS = (1, 5, 10)
@@ -256,6 +266,106 @@ def evaluate_rankings(
     if n_queries == 0:
         return {key: 0.0 for key in keys}
     return {key: sums[key] / n_queries for key in keys}
+
+
+def rank_diagnostics(
+    reranker_queries: Sequence[tuple[ArrayLike, ArrayLike]],
+    retrieval_queries: Sequence[tuple[ArrayLike, ArrayLike]],
+) -> dict[str, Any]:
+    """Summarize how reranking moves the gold item relative to FAISS order.
+
+    The regular metrics say whether each ranking is good. This diagnostic says
+    whether the reranker actually changed the gold paper's rank, which matters
+    when the retrieval baseline is already saturated near rank 1.
+    """
+    if len(reranker_queries) != len(retrieval_queries):
+        raise ValueError(
+            "reranker_queries and retrieval_queries must be aligned, got "
+            f"{len(reranker_queries)} and {len(retrieval_queries)}"
+        )
+
+    rows: list[dict[str, Any]] = []
+    hard_reranker: list[tuple[ArrayLike, ArrayLike]] = []
+    hard_retrieval: list[tuple[ArrayLike, ArrayLike]] = []
+    improved = same = worsened = gold_missed = empty = 0
+    deltas: list[int] = []
+
+    for query_index, ((rr_scores, rr_labels), (rt_scores, rt_labels)) in enumerate(
+        zip(reranker_queries, retrieval_queries)
+    ):
+        if len(rr_scores) == 0:
+            empty += 1
+            rows.append(
+                {
+                    "query_index": query_index,
+                    "candidate_count": 0,
+                    "gold_retrieved": False,
+                    "faiss_rank": None,
+                    "reranker_rank": None,
+                    "rank_delta": None,
+                    "outcome": "empty",
+                    "hard_query": False,
+                }
+            )
+            continue
+
+        faiss_rank = _first_relevant_rank(rt_scores, rt_labels)
+        reranker_rank = _first_relevant_rank(rr_scores, rr_labels)
+        if faiss_rank is None or reranker_rank is None:
+            gold_missed += 1
+            outcome = "missed"
+            rank_delta = None
+            hard_query = False
+        else:
+            rank_delta = faiss_rank - reranker_rank
+            deltas.append(rank_delta)
+            hard_query = faiss_rank > 1
+            if hard_query:
+                hard_reranker.append((rr_scores, rr_labels))
+                hard_retrieval.append((rt_scores, rt_labels))
+            if rank_delta > 0:
+                improved += 1
+                outcome = "improved"
+            elif rank_delta < 0:
+                worsened += 1
+                outcome = "worsened"
+            else:
+                same += 1
+                outcome = "same"
+
+        rows.append(
+            {
+                "query_index": query_index,
+                "candidate_count": len(rr_scores),
+                "gold_retrieved": faiss_rank is not None,
+                "faiss_rank": faiss_rank,
+                "reranker_rank": reranker_rank,
+                "rank_delta": rank_delta,
+                "outcome": outcome,
+                "hard_query": hard_query,
+            }
+        )
+
+    total_nonempty = len(reranker_queries) - empty
+    return {
+        "summary": {
+            "n_queries": len(reranker_queries),
+            "n_nonempty": total_nonempty,
+            "n_empty": empty,
+            "n_gold_missed": gold_missed,
+            "n_hard_queries": len(hard_reranker),
+            "improved": improved,
+            "same": same,
+            "worsened": worsened,
+            "mean_rank_delta": float(np.mean(deltas)) if deltas else 0.0,
+            "median_rank_delta": float(np.median(deltas)) if deltas else 0.0,
+        },
+        "hard_metrics": {
+            "reranker": evaluate_rankings(hard_reranker),
+            "retrieval_only": evaluate_rankings(hard_retrieval),
+        },
+        "per_query": rows,
+    }
 
 
 # --------------------------------------------------------------------------- #
