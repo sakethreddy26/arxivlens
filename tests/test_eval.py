@@ -474,3 +474,126 @@ def test_build_retrieval_eval_moves_gpu_tensor_to_host_before_numpy():
     out = evaluate_rankings(queries)
     assert out["recall@1"] == pytest.approx(1.0, abs=TOL)
     assert out["mrr"] == pytest.approx(1.0, abs=TOL)
+
+
+# --------------------------------------------------------------------------
+# build_retrieval_eval_queries — with_retrieval_baseline=True branch
+# --------------------------------------------------------------------------
+def test_build_retrieval_eval_baseline_return_shape():
+    # with_retrieval_baseline=True -> a 2-tuple of two lists; default -> plain list.
+    cands = [_candidate("P0", "gold"), _candidate("N0", "neg0")]
+    retriever = _FakeRetriever({"gold-query": cands})
+    reranker = _FakeReranker({"gold": 1.0, "neg0": 0.0})
+    records = [{"id": "P0", "title": "gold-query", "abstract": "x"}]
+
+    result = build_retrieval_eval_queries(
+        records, retriever, reranker, num_candidates=50, with_retrieval_baseline=True
+    )
+    assert isinstance(result, tuple) and len(result) == 2
+    reranker_out, retrieval_out = result
+    assert isinstance(reranker_out, list) and isinstance(retrieval_out, list)
+
+    default = build_retrieval_eval_queries(
+        records, _FakeRetriever({"gold-query": cands}), reranker, num_candidates=50
+    )
+    assert isinstance(default, list) and not isinstance(default, tuple)
+
+
+def test_build_retrieval_eval_baseline_aligned_labels():
+    # Both paths are aligned index-for-index and share the SAME labels per query;
+    # only the score vectors differ.
+    cands_a = [_candidate("A0", "agold")] + [
+        _candidate(f"AN{i}", f"aneg{i}") for i in range(4)
+    ]
+    cands_b = [_candidate(f"BN{i}", f"bneg{i}") for i in range(3)]  # gold B0 absent
+    retriever = _FakeRetriever({"a-query": cands_a, "b-query": cands_b})
+    scores = {"agold": 10.0}
+    scores.update({f"aneg{i}": float(-i) for i in range(4)})
+    scores.update({f"bneg{i}": float(-i) for i in range(3)})
+    reranker = _FakeReranker(scores)
+    records = [
+        {"id": "A0", "title": "a-query", "abstract": "x"},
+        {"id": "B0", "title": "b-query", "abstract": "y"},
+    ]
+
+    reranker_out, retrieval_out = build_retrieval_eval_queries(
+        records, retriever, reranker, num_candidates=50, with_retrieval_baseline=True
+    )
+    assert len(reranker_out) == len(retrieval_out) == 2
+    for (rr_scores, rr_labels), (rt_scores, rt_labels) in zip(
+        reranker_out, retrieval_out
+    ):
+        # Same candidate set/labels -> identical label vectors index-for-index.
+        assert rr_labels == rt_labels
+        # Same length; only the scores differ between the two paths.
+        assert len(rr_scores) == len(rt_scores) == len(rr_labels)
+
+
+def test_build_retrieval_eval_baseline_scores_encode_faiss_order():
+    # Retrieval-only score for a query with N candidates is [N, N-1, ..., 1.0],
+    # strictly descending in retrieval (FAISS) order.
+    cands = [_candidate("P0", "gold")] + [
+        _candidate(f"N{i}", f"neg{i}") for i in range(6)
+    ]  # N = 7 candidates
+    retriever = _FakeRetriever({"gold-query": cands})
+    reranker = _FakeReranker({"gold": 1.0})
+    records = [{"id": "P0", "title": "gold-query", "abstract": "x"}]
+
+    _reranker_out, retrieval_out = build_retrieval_eval_queries(
+        records, retriever, reranker, num_candidates=50, with_retrieval_baseline=True
+    )
+    rt_scores, _rt_labels = retrieval_out[0]
+    n = len(cands)
+    assert rt_scores == [float(v) for v in range(n, 0, -1)]
+    assert rt_scores == [7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]
+
+
+def test_build_retrieval_eval_baseline_is_weaker_than_reranker():
+    # Gold is retrieved at FAISS rank 2 (candidate index 1). The retrieval-only
+    # baseline therefore scores it at rank 2 -> MRR 0.5, recall@1 0.0. The fake
+    # reranker floats the gold to the top -> MRR/recall@1 = 1.0. This shows the
+    # baseline is a genuine, weaker comparison.
+    cands = [
+        _candidate("N0", "neg0"),  # FAISS rank 1 (not gold)
+        _candidate("P0", "gold"),  # FAISS rank 2 (gold)
+        _candidate("N1", "neg1"),
+    ]
+    retriever = _FakeRetriever({"gold-query": cands})
+    # Reranker gives gold the top score, floating it to reranked rank 1.
+    reranker = _FakeReranker({"gold": 10.0, "neg0": 0.0, "neg1": -1.0})
+    records = [{"id": "P0", "title": "gold-query", "abstract": "x"}]
+
+    reranker_out, retrieval_out = build_retrieval_eval_queries(
+        records, retriever, reranker, num_candidates=50, with_retrieval_baseline=True
+    )
+
+    baseline_metrics = evaluate_rankings(retrieval_out)
+    assert baseline_metrics["mrr"] == pytest.approx(0.5, abs=TOL)
+    assert baseline_metrics["recall@1"] == pytest.approx(0.0, abs=TOL)
+
+    reranker_metrics = evaluate_rankings(reranker_out)
+    assert reranker_metrics["mrr"] == pytest.approx(1.0, abs=TOL)
+    assert reranker_metrics["recall@1"] == pytest.approx(1.0, abs=TOL)
+
+
+def test_build_retrieval_eval_baseline_empty_candidates_both_lists():
+    # A record whose retriever returns [] yields ([], []) in BOTH lists at the
+    # same index, aligned with a non-empty query.
+    cands = [_candidate("P0", "gold")]
+    retriever = _FakeRetriever({"has-cands": cands})  # "no-cands" -> []
+    reranker = _FakeReranker({"gold": 1.0})
+    records = [
+        {"id": "E0", "title": "no-cands", "abstract": "x"},  # empty retrieval
+        {"id": "P0", "title": "has-cands", "abstract": "y"},  # non-empty
+    ]
+
+    reranker_out, retrieval_out = build_retrieval_eval_queries(
+        records, retriever, reranker, num_candidates=50, with_retrieval_baseline=True
+    )
+    assert len(reranker_out) == len(retrieval_out) == 2
+    # Index 0: empty-candidate query -> ([], []) in BOTH lists.
+    assert reranker_out[0] == ([], [])
+    assert retrieval_out[0] == ([], [])
+    # Index 1: the non-empty query remains aligned and populated in both.
+    assert reranker_out[1][1] == [1.0]
+    assert retrieval_out[1] == ([1.0], [1.0])

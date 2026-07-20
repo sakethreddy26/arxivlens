@@ -290,7 +290,15 @@ def build_retrieval_eval_queries(
     retriever: Any,
     reranker: Any,
     num_candidates: int,
-) -> list[tuple[list[float], list[float]]]:
+    *,
+    with_retrieval_baseline: bool = False,
+) -> (
+    list[tuple[list[float], list[float]]]
+    | tuple[
+        list[tuple[list[float], list[float]]],
+        list[tuple[list[float], list[float]]],
+    ]
+):
     """Assemble ``(scores, labels)`` per query via real retrieve-then-rerank.
 
     This is the non-degenerate replacement for scoring a query against only its
@@ -338,10 +346,26 @@ def build_retrieval_eval_queries(
         reranker: object with ``score(query: str, passages: Sequence[str])``
             returning a length-``len(passages)`` array-like of scores.
         num_candidates: candidates to retrieve per query (the eval breadth).
+        with_retrieval_baseline: keyword-only. When ``False`` (default) the
+            return type and behavior are unchanged (a single list). When
+            ``True`` a retrieval-only baseline is emitted alongside the reranker
+            queries so the two can be compared head-to-head over the IDENTICAL
+            held-out queries and candidate sets.
 
     Returns:
-        One ``(scores, labels)`` tuple per query, both plain ``list[float]`` of
-        equal length, ready to hand to :func:`evaluate_rankings`.
+        When ``with_retrieval_baseline`` is ``False``: one ``(scores, labels)``
+        tuple per query, both plain ``list[float]`` of equal length, ready to
+        hand to :func:`evaluate_rankings`.
+
+        When ``with_retrieval_baseline`` is ``True``: a 2-tuple
+        ``(reranker_out, retrieval_out)`` of two such lists, aligned
+        index-for-index (same query, same candidate set, same labels — only the
+        score vector differs). The retrieval-only scores encode the FAISS rank
+        order: candidate ``j`` (0-based) gets score ``len(candidates) - j``, a
+        strictly-descending vector that reproduces the retriever's ranking under
+        the stable-sort metric. Because those scores come from the SAME single
+        retrieval pass (not a second ``retrieve()`` call), the baseline is
+        guaranteed to share the reranker's exact candidate sets.
 
     Raises:
         ValueError: if a record's ``id`` looks like a bare positional index
@@ -349,6 +373,7 @@ def build_retrieval_eval_queries(
             reconstruction, making label matching meaningless).
     """
     out: list[tuple[list[float], list[float]]] = []
+    retrieval_out: list[tuple[list[float], list[float]]] = []
 
     for record in eval_records:
         title = "" if record.get("title") is None else str(record["title"])
@@ -367,6 +392,7 @@ def build_retrieval_eval_queries(
         if not candidates:
             # Empty ranking; evaluate_rankings skips it. Nothing to score.
             out.append(([], []))
+            retrieval_out.append(([], []))
             continue
 
         # Passage text mirrors retrieve/pipeline.py: each candidate's OWN
@@ -402,4 +428,14 @@ def build_retrieval_eval_queries(
 
         out.append((scores_list, labels))
 
+        # Retrieval-only baseline over the SAME candidates in the SAME order.
+        # retriever.retrieve returns candidates in decreasing similarity order
+        # (rank 1 first), so a strictly-descending score vector (N, N-1, ..., 1)
+        # reproduces the FAISS ranking exactly under evaluate_rankings' stable
+        # sort. No stored similarity scores needed — rank order is sufficient.
+        retrieval_scores = [float(len(candidates) - j) for j in range(len(candidates))]
+        retrieval_out.append((retrieval_scores, labels))
+
+    if with_retrieval_baseline:
+        return out, retrieval_out
     return out

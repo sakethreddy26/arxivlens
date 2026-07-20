@@ -122,6 +122,12 @@ EVAL_NUM_CANDIDATES="${EVAL_NUM_CANDIDATES:-50}"
 EVAL_INDEX_PATH="${EVAL_INDEX_PATH:-$SCRATCH/index/index.faiss}"
 EVAL_META_PATH="${EVAL_META_PATH:-$SCRATCH/index/meta.jsonl}"
 
+# Durable provenance artifact directory. The Python heredoc writes one JSON per
+# job here (results/eval_<SLURM_JOB_ID>.json) recording exactly which run/
+# checkpoint produced which numbers, so README/MODEL_CARD figures stay traceable.
+# Lives under the same Sol scratch tree ($SCRATCH) as the index/checkpoints.
+EVAL_RESULTS_DIR="${EVAL_RESULTS_DIR:-$SCRATCH/results}"
+
 # Fail fast only if NEITHER pair source exists — otherwise the Python heredoc
 # below picks whichever is available (explicit val > auto-split from training).
 if [ ! -f "$VAL_PAIRS_FILE" ] && [ ! -f "$PAIRS_FILE" ]; then
@@ -152,6 +158,7 @@ export CHECKPOINT_DIR
 export EVAL_NUM_CANDIDATES
 export EVAL_INDEX_PATH
 export EVAL_META_PATH
+export EVAL_RESULTS_DIR
 
 # =============================================================================
 # 5. Change into the repo (keeps relative imports consistent with training)
@@ -196,6 +203,7 @@ python3 - <<'PYEOF'
 import os
 import sys
 import json
+import datetime
 import torch
 from pathlib import Path
 
@@ -378,26 +386,32 @@ retriever = FaissRetriever(index_path=index_path, meta_path=meta_path)
 # candidates from FAISS, rerank them with the cross-encoder, and label the
 # query's own paper as the single positive. This is the desaturated protocol.
 print(f"[eval] Retrieving {num_candidates} candidates/query and reranking ...")
-all_queries = build_retrieval_eval_queries(
+reranker_queries, retrieval_queries = build_retrieval_eval_queries(
     eval_records=eval_records,
     retriever=retriever,
     reranker=model,
     num_candidates=num_candidates,
+    with_retrieval_baseline=True,
 )
 
-metrics = evaluate_rankings(all_queries)
+# Reranker metrics (existing var name kept) plus a retrieval-only baseline over
+# the IDENTICAL candidate sets, so the from-scratch cross-encoder has a
+# head-to-head comparison (closes the G5 retrieval-only-baseline blocker).
+metrics = evaluate_rankings(reranker_queries)
+baseline_metrics = evaluate_rankings(retrieval_queries)
 
 # Interpretability: a query whose gold paper never made it into the retrieved
 # candidate set has an all-zero label vector — no reranker can recover it, so it
 # caps every metric. Counting these separates reranker quality from the
 # retriever recall ceiling.
-n_scored = sum(1 for s, _ in all_queries if s)
-n_missed = sum(1 for s, l in all_queries if s and 1.0 not in l)
+n_scored = sum(1 for s, _ in reranker_queries if s)
+n_missed = sum(1 for s, l in reranker_queries if s and 1.0 not in l)
 
 print()
 print("=== ArXivLens Reranker Evaluation (retrieve-then-rerank) ===")
-for k, v in metrics.items():
-    print(f"  {k:15s}: {v:.4f}")
+print(f"{'metric':17s} {'retrieval-only':16s} {'+ reranker'}")
+for k in metrics:
+    print(f"{k:17s} {baseline_metrics[k]:<16.4f} {metrics[k]:.4f}")
 print()
 print(f"Checkpoint          : {ckpt_path}")
 print(f"Eval source         : {eval_source}")
@@ -409,6 +423,42 @@ print(
     f"Skipped (positional id): {n_skipped_positional}  "
     "(unscoreable — real id lost in reconstruction, dropped not scored)"
 )
+
+# -------------------------------------------------------------------------- #
+# Durable provenance artifact.
+# Everything above prints to the .out log only, which is ephemeral and easy to
+# mis-transcribe into README/MODEL_CARD. Write one JSON file per job recording
+# EXACTLY which run/checkpoint produced which numbers, so published figures stay
+# traceable and can never be silently mismatched. Purely additive — all stdout
+# above is preserved.
+# -------------------------------------------------------------------------- #
+job_id = os.environ.get("SLURM_JOB_ID", "")
+results_dir = os.environ.get("EVAL_RESULTS_DIR", "results")
+os.makedirs(results_dir, exist_ok=True)
+# Fall back to "local" when run outside slurm so this never crashes / collides.
+out_path = os.path.join(results_dir, f"eval_{job_id or 'local'}.json")
+
+report = {
+    "checkpoint": ckpt_path,
+    "slurm_job_id": job_id,
+    "eval_source": eval_source,
+    "index_path": index_path,
+    "meta_path": meta_path,
+    "num_candidates": num_candidates,
+    "n_queries": n_scored,
+    "gold_missed_retrieval": n_missed,
+    "skipped_positional_id": n_skipped_positional,
+    "metrics": {
+        "reranker": metrics,
+        "retrieval_only": baseline_metrics,
+    },
+    "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(report, fh, indent=2)
+
+print(f"[eval] Wrote results artifact: {out_path}")
 PYEOF
 
 # =============================================================================
