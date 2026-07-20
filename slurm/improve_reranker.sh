@@ -39,6 +39,18 @@ CONDA_ENV="${ARXIVLENS_ENV:-/packages/envs/genai25.09}"
 source activate "$CONDA_ENV"
 export PYTHONPATH="$REPO_DIR/src:${PYTHONPATH:-}"
 
+if ! python3 -c 'import torch' >/dev/null 2>&1; then
+    echo "[workflow] ERROR: $CONDA_ENV did not provide PyTorch." >&2
+    echo "[workflow] Active Python: $(command -v python3)" >&2
+    exit 1
+fi
+
+# Child train/eval scripts must reuse this environment. Loading the Mamba
+# module twice can reset PATH to Mamba's base interpreter, which has no torch.
+export ARXIVLENS_ENV_READY=1
+echo "[workflow] Environment ready: $(command -v python3)"
+echo "[workflow] PyTorch: $(python3 -c 'import torch; print(torch.__version__)')"
+
 if [ ! -f "$PAIRS_FILE" ] || [ ! -f "$VAL_PAIRS_FILE" ]; then
     TMP_PAIRS="${PAIRS_FILE}.tmp.${SLURM_JOB_ID}"
     TMP_VAL_PAIRS="${VAL_PAIRS_FILE}.tmp.${SLURM_JOB_ID}"

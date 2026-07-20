@@ -87,9 +87,6 @@ export OMP_NUM_THREADS=4
 # =============================================================================
 # 3. Load conda environment
 # =============================================================================
-module purge                        # start from a clean module state
-module load mamba/latest            # makes `source activate` available
-
 # The genai25.09 environment contains accelerate, mlflow, transformers, faiss,
 # torch, etc.  Using the absolute path bypasses any .conda/environments.txt
 # lookup, which is more robust on shared systems where multiple users may have
@@ -98,11 +95,24 @@ module load mamba/latest            # makes `source activate` available
 # If Sol provisions a different env, override without editing this file:
 #   export ARXIVLENS_ENV=/path/to/your/env  (then sbatch as normal)
 CONDA_ENV="${ARXIVLENS_ENV:-/packages/envs/genai25.09}"
-# shellcheck disable=SC1091
-source activate "$CONDA_ENV"
+
+if [ "${ARXIVLENS_ENV_READY:-0}" = "1" ]; then
+    echo "[env] Reusing environment activated by the parent workflow."
+else
+    module purge
+    module load mamba/latest
+    # shellcheck disable=SC1091
+    source activate "$CONDA_ENV"
+fi
+
+if ! python3 -c 'import torch' >/dev/null 2>&1; then
+    echo "[env] ERROR: PyTorch is unavailable in $(command -v python3)." >&2
+    echo "[env] Expected the Sol environment at $CONDA_ENV." >&2
+    exit 1
+fi
 
 echo "[env] Conda   : $CONDA_ENV"
-echo "[env] Python : $(which python)"
+echo "[env] Python : $(command -v python3)"
 echo "[env] PyTorch: $(python3 -c 'import torch; print(torch.__version__)')"
 echo "[env] CUDA   : $(python3 -c 'import torch; print(torch.version.cuda)')"
 
