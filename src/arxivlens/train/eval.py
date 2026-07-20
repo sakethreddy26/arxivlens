@@ -382,6 +382,17 @@ def build_retrieval_eval_queries(
 
         # Coerce whatever the reranker returned (torch tensor, ndarray, list)
         # into a flat list of floats without importing torch here.
+        #
+        # reranker.score may return a torch tensor (possibly on GPU), an ndarray,
+        # or a list. Move a GPU tensor to host WITHOUT importing torch by duck-typing
+        # the tensor API: .detach() drops autograd, .cpu() copies device->host. numpy
+        # cannot read a cuda tensor directly (raises TypeError), so this is required
+        # for the real CrossEncoderReranker on an A100; ndarrays/lists lack these
+        # methods and pass straight through.
+        if hasattr(scores, "detach"):
+            scores = scores.detach()
+        if hasattr(scores, "cpu"):
+            scores = scores.cpu()
         scores_list = [float(s) for s in np.asarray(scores, dtype=np.float64).ravel()]
 
         labels = [

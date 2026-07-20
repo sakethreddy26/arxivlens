@@ -7,6 +7,7 @@ All floats are asserted with a tolerance.
 
 import math
 
+import numpy as np
 import pytest
 
 from arxivlens.train.eval import (
@@ -404,3 +405,72 @@ def test_build_retrieval_eval_empty_retrieval_yields_empty_ranking():
     out = evaluate_rankings(queries)
     for value in out.values():
         assert value == pytest.approx(0.0, abs=TOL)
+
+
+class _FakeCudaTensor:
+    """Mimics a torch tensor sitting on a CUDA device.
+
+    np.asarray() / __array__ RAISES while the tensor is "on GPU" (exactly the
+    TypeError the real A100 crash raised), so numpy can only read it after the
+    caller has moved it to host via .detach().cpu(). ``.cpu()`` returns a plain
+    host list, proving eval.py exercised the duck-typed device->host path.
+    """
+
+    def __init__(self, values, on_gpu: bool = True):
+        self._values = list(values)
+        self._on_gpu = on_gpu
+
+    def __array__(self, dtype=None):
+        if self._on_gpu:
+            raise TypeError(
+                "can't convert cuda:0 device type tensor to numpy. "
+                "Use Tensor.cpu() to copy the tensor to host memory first."
+            )
+        return np.asarray(self._values, dtype=dtype)
+
+    def detach(self):
+        # Autograd no-op; still "on device".
+        return self
+
+    def cpu(self):
+        # Copy device -> host: return a plain, numpy-convertible list.
+        return list(self._values)
+
+
+class _CudaReranker:
+    """Reranker whose .score returns a GPU-resident tensor-like object."""
+
+    def __init__(self, score_by_title: dict[str, float]):
+        self._score_by_title = score_by_title
+
+    def score(self, query: str, passages):
+        out = [self._score_by_title.get(p.split(" ", 1)[0], 0.0) for p in passages]
+        return _FakeCudaTensor(out, on_gpu=True)
+
+
+def test_build_retrieval_eval_moves_gpu_tensor_to_host_before_numpy():
+    # Regression for the Sol A100 crash (job 59310148): reranker.score returns a
+    # CUDA tensor and np.asarray on it raises TypeError. eval.py must duck-type
+    # .detach()/.cpu() to move it to host first. This reproduces the failure
+    # mode with no GPU and no torch.
+    cands = [_candidate("P0", "gold")] + [
+        _candidate(f"N{i}", f"neg{i}") for i in range(49)
+    ]
+    retriever = _FakeRetriever({"gold-query": cands})
+    scores = {"gold": 10.0, **{f"neg{i}": float(-i) for i in range(49)}}
+    reranker = _CudaReranker(scores)
+
+    records = [{"id": "P0", "title": "gold-query", "abstract": "whatever"}]
+
+    # Must not raise the CUDA-tensor TypeError.
+    queries = build_retrieval_eval_queries(records, retriever, reranker, num_candidates=50)
+
+    assert len(queries) == 1
+    q_scores, q_labels = queries[0]
+    assert len(q_scores) == 50 and len(q_labels) == 50
+    assert q_scores[0] == pytest.approx(10.0, abs=TOL)  # gold score survived
+    assert sum(q_labels) == 1.0 and q_labels[0] == 1.0
+
+    out = evaluate_rankings(queries)
+    assert out["recall@1"] == pytest.approx(1.0, abs=TOL)
+    assert out["mrr"] == pytest.approx(1.0, abs=TOL)
