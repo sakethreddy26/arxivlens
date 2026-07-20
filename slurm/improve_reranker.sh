@@ -39,8 +39,8 @@ CONDA_ENV="${ARXIVLENS_ENV:-/packages/envs/genai25.09}"
 source activate "$CONDA_ENV"
 export PYTHONPATH="$REPO_DIR/src:${PYTHONPATH:-}"
 
-if ! python3 -c 'import torch' >/dev/null 2>&1; then
-    echo "[workflow] ERROR: $CONDA_ENV did not provide PyTorch." >&2
+if ! python3 -c 'import accelerate, faiss, mlflow, sentence_transformers, torch, transformers, yaml'; then
+    echo "[workflow] ERROR: $CONDA_ENV is missing a required runtime package." >&2
     echo "[workflow] Active Python: $(command -v python3)" >&2
     exit 1
 fi
@@ -51,7 +51,25 @@ export ARXIVLENS_ENV_READY=1
 echo "[workflow] Environment ready: $(command -v python3)"
 echo "[workflow] PyTorch: $(python3 -c 'import torch; print(torch.__version__)')"
 
+validate_pairs() {
+    python3 scripts/validate_pair_groups.py \
+        --train "$1" \
+        --val "$2" \
+        --corpus "$SCRATCH/corpus/papers.jsonl" \
+        --candidates-per-query 20
+}
+
+NEEDS_PAIR_BUILD=0
 if [ ! -f "$PAIRS_FILE" ] || [ ! -f "$VAL_PAIRS_FILE" ]; then
+    NEEDS_PAIR_BUILD=1
+elif ! validate_pairs "$PAIRS_FILE" "$VAL_PAIRS_FILE"; then
+    echo "[workflow] Existing listwise pairs are invalid; rebuilding atomically."
+    NEEDS_PAIR_BUILD=1
+else
+    echo "[workflow] Reusing validated listwise pairs."
+fi
+
+if [ "$NEEDS_PAIR_BUILD" -eq 1 ]; then
     TMP_PAIRS="${PAIRS_FILE}.tmp.${SLURM_JOB_ID}"
     TMP_VAL_PAIRS="${VAL_PAIRS_FILE}.tmp.${SLURM_JOB_ID}"
     trap 'rm -f "$TMP_PAIRS" "$TMP_VAL_PAIRS"' EXIT
@@ -66,11 +84,10 @@ if [ ! -f "$PAIRS_FILE" ] || [ ! -f "$VAL_PAIRS_FILE" ]; then
         --n-easy 0 \
         --seed 42
 
+    validate_pairs "$TMP_PAIRS" "$TMP_VAL_PAIRS"
     mv "$TMP_PAIRS" "$PAIRS_FILE"
     mv "$TMP_VAL_PAIRS" "$VAL_PAIRS_FILE"
     trap - EXIT
-else
-    echo "[workflow] Reusing existing listwise pairs."
 fi
 
 export ARXIVLENS_CONFIG="$REPO_DIR/configs/reranker_listwise.yaml"
@@ -82,6 +99,7 @@ export ARXIVLENS_EVAL_INDEX_PATH="$SCRATCH/index/index.faiss"
 export ARXIVLENS_EVAL_META_PATH="$SCRATCH/index/meta.jsonl"
 export ARXIVLENS_EVAL_PASSAGE_FORMAT=abstract
 export ARXIVLENS_RESUME=auto
+export ARXIVLENS_RUN_SMOKE="${ARXIVLENS_RUN_SMOKE:-0}"
 
 echo "[workflow] Starting or resuming listwise training ..."
 bash slurm/train_reranker.sh

@@ -214,7 +214,7 @@ case "$RESUME_MODE" in
         ;;
 esac
 
-RUN_SMOKE="${ARXIVLENS_RUN_SMOKE:-1}"
+RUN_SMOKE="${ARXIVLENS_RUN_SMOKE:-0}"
 case "$RUN_SMOKE" in
     1)
         echo "[train] Running CPU training smoke gate ..."

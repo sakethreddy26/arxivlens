@@ -234,7 +234,7 @@ def _run_eval(
     ``build_pairs.py``).
 
     Args:
-        model: the reranker (may be DDP-wrapped; forward still works).
+        model: the reranker, possibly wrapped for distributed training.
         val_loader: dataloader over the held-out pairs; batches carry
             ``query_ids`` (a list[str]) from ``collate_fn``.
         accelerator: used only to move tensors; eval always runs on main process.
@@ -243,7 +243,12 @@ def _run_eval(
         Dict with keys from ``evaluate_rankings``:
         ``ndcg@5``, ``ndcg@10``, ``mrr``, ``recall@1``, ``recall@5``, ``recall@10``.
     """
-    model.eval()
+    # Only rank 0 runs validation. Calling a DDP wrapper on rank 0 while other
+    # ranks wait can deadlock on DDP's forward-time buffer synchronization, so
+    # evaluate the underlying module directly.
+    eval_model = accelerator.unwrap_model(model)
+    was_training = eval_model.training
+    eval_model.eval()
     # query_id -> (scores, labels) accumulated across every batch.
     groups: dict[str, tuple[list[float], list[float]]] = {}
 
@@ -257,7 +262,7 @@ def _run_eval(
                 # moved to the right device here.
                 input_ids = batch["input_ids"].to(accelerator.device)
                 attention_mask = batch["attention_mask"].to(accelerator.device)
-                logits = model(input_ids, attention_mask)  # (B,)
+                logits = eval_model(input_ids, attention_mask)  # (B,)
                 scores = logits.cpu().float().tolist()
                 labels = batch["labels"].cpu().float().tolist()
                 query_ids = batch["query_ids"]
@@ -266,7 +271,8 @@ def _run_eval(
                     bucket[0].append(s)
                     bucket[1].append(l)
     finally:
-        model.train()
+        if was_training:
+            eval_model.train()
 
     # Skip empty groups (evaluate_rankings also skips empties, but be explicit).
     all_queries = [(s, l) for s, l in groups.values() if s]

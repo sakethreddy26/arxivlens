@@ -19,19 +19,20 @@ epoch-boundary), and eval are all wired correctly:
     (f) listwise mode -- complete query groups train end-to-end, produce finite
         losses, and save the requested ranking objective in checkpoint provenance.
 
-No network, no GPU, no HuggingFace download: the tokenizer is the deterministic
-``StubTokenizer`` from ``tests/test_dataset.py`` and everything runs in a temp
-directory that is cleaned up on exit.
+No network or HuggingFace download: the tokenizer is a self-contained,
+deterministic stub and everything runs in a temporary directory that is cleaned
+up on exit. The script has no dependency on pytest or the tests package.
 
 Run it directly::
 
     python scripts/smoke_test.py
 
-Exit code is 0 only when all five assertions pass.
+Exit code is 0 only when all six assertions pass.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import shutil
@@ -46,11 +47,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
-# tests/ holds the offline StubTokenizer we reuse here.
-_TESTS = _REPO_ROOT / "tests"
-if str(_TESTS) not in sys.path:
-    sys.path.insert(0, str(_TESTS))
-
 import torch  # noqa: E402
 
 # Neutralize MLflow so the smoke test never touches a tracking backend: some
@@ -84,7 +80,43 @@ from arxivlens.train.train_reranker import (  # noqa: E402
     _Namespace,
     run_training,
 )
-from test_dataset import StubTokenizer  # noqa: E402  (offline, no HF download)
+
+
+class StubTokenizer:
+    """Small deterministic tokenizer for the optional offline smoke test."""
+
+    cls_token_id = 0
+    sep_token_id = 1
+    _vocab_size = 32
+
+    def _word_to_id(self, word: str) -> int:
+        digest = hashlib.md5(word.encode()).hexdigest()
+        return 3 + (int(digest, 16) % (self._vocab_size - 3))
+
+    def __call__(
+        self,
+        text_a: str,
+        text_b: str | None = None,
+        max_length: int = 256,
+        truncation: bool = True,
+        **_kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        ids = [self.cls_token_id]
+        ids.extend(self._word_to_id(word) for word in text_a.split())
+        ids.append(self.sep_token_id)
+        if text_b is not None:
+            ids.extend(self._word_to_id(word) for word in text_b.split())
+            ids.append(self.sep_token_id)
+        if truncation and len(ids) > max_length:
+            ids = ids[: max_length - 1] + [self.sep_token_id]
+        return {
+            "input_ids": torch.tensor([ids], dtype=torch.long),
+            "attention_mask": torch.ones((1, len(ids)), dtype=torch.long),
+        }
+
+    def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+        special = {self.cls_token_id: "[CLS]", self.sep_token_id: "[SEP]"}
+        return [special.get(token_id, f"tok_{token_id}") for token_id in ids]
 
 
 # --------------------------------------------------------------------------- #
