@@ -33,3 +33,6 @@ CLAUDE.md
 .vscode/
 .idea/
 .DS_Store
+
+# Generated documentation
+model_documentation/
