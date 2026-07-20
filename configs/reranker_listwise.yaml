@@ -1,0 +1,40 @@
+model:
+  vocab_size: 30522
+  d_model: 512
+  n_heads: 8
+  n_layers: 6
+  d_ff: 2048
+  max_len: 512
+  dropout: 0.1
+  max_input_length: 256
+
+training:
+  # Sol commands override these paths with dedicated listwise-v1 artifacts.
+  pairs_file: "corpus/pairs_listwise_v1.jsonl"
+  val_pairs_file: "corpus/val_pairs_listwise_v1.jsonl"
+  checkpoint_dir: "checkpoints/listwise_v1"
+  mlflow_dir: "mlruns/listwise_v1"
+
+  # Complete query groups are batched together. With 20 candidates/query,
+  # six groups produce about 120 cross-encoder sequences per A100 process.
+  loss_type: "listwise"
+  queries_per_batch: 6
+  bce_aux_weight: 0.1
+
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  batch_size: 128          # validation batch size; listwise train uses groups
+  n_epochs: 12
+  warmup_steps: 500
+  lr_schedule: "cosine"
+  grad_clip: 1.0
+  checkpoint_every_steps: 500
+  eval_every_steps: 500
+  val_fraction: 0.1
+  seed: 42
+  tokenizer_name: "bert-base-uncased"
+
+  eval_num_candidates: 50
+  eval_passage_format: "abstract"
+  eval_index_path: "index/index.faiss"
+  eval_meta_path: "index/meta.jsonl"

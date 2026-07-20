@@ -19,9 +19,14 @@ from typing import Any
 import pytest
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from arxivlens.data.dataset import PairDataset, collate_fn
+from arxivlens.data.dataset import (
+    PairDataset,
+    QueryGroupDataset,
+    collate_fn,
+    collate_query_groups,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -365,3 +370,59 @@ def test_collate_padding_mask_is_zero(dataset: PairDataset) -> None:
             assert pad_ids.sum().item() == 0, (
                 f"Row {i}: expected zero ids in padding beyond position {orig_len}"
             )
+
+
+def _write_grouped_pairs(path: Path) -> None:
+    records = [
+        {"query_id": "q0", "query": "query zero", "passage": "gold zero", "label": 1},
+        {"query_id": "q1", "query": "query one", "passage": "negative one", "label": 0},
+        {"query_id": "q0", "query": "query zero", "passage": "negative zero", "label": 0},
+        {"query_id": "q1", "query": "query one", "passage": "gold one", "label": 1},
+    ]
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def test_query_group_dataset_keeps_complete_groups(
+    tmp_path: Path, tokenizer: StubTokenizer
+) -> None:
+    path = tmp_path / "grouped.jsonl"
+    _write_grouped_pairs(path)
+    grouped = QueryGroupDataset(PairDataset(path, tokenizer, max_length=64))
+
+    assert len(grouped) == 2
+    assert grouped.group_sizes() == [2, 2]
+    batch = collate_query_groups([grouped[0], grouped[1]])
+    assert batch["query_ids"] == ["q0", "q0", "q1", "q1"]
+    assert batch["labels"].tolist() == [1.0, 0.0, 0.0, 1.0]
+
+
+def test_query_group_dataset_supports_subset(
+    tmp_path: Path, tokenizer: StubTokenizer
+) -> None:
+    path = tmp_path / "grouped.jsonl"
+    _write_grouped_pairs(path)
+    dataset = PairDataset(path, tokenizer, max_length=64)
+    grouped = QueryGroupDataset(Subset(dataset, [0, 2]))
+
+    assert len(grouped) == 1
+    assert grouped.group_sizes() == [2]
+
+
+def test_query_group_dataset_rejects_multiple_positives(
+    tmp_path: Path, tokenizer: StubTokenizer
+) -> None:
+    path = tmp_path / "bad-group.jsonl"
+    records = [
+        {"query_id": "q0", "query": "q", "passage": "a", "label": 1},
+        {"query_id": "q0", "query": "q", "passage": "b", "label": 1},
+    ]
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
+        QueryGroupDataset(PairDataset(path, tokenizer, max_length=64))

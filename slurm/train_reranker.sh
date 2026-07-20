@@ -77,7 +77,7 @@ export TOKENIZERS_PARALLELISM=false
 
 # Tell MLflow where to write experiment metadata.  Both the trainer (--mlflow-dir)
 # and this env var point to the same directory so `mlflow ui` finds everything.
-export MLFLOW_TRACKING_URI=/scratch/$USER/mlrag/mlruns
+export MLFLOW_TRACKING_URI="${ARXIVLENS_MLFLOW_DIR:-/scratch/$USER/mlrag/mlruns}"
 
 # Cap the number of OpenMP threads per process.  With 2 DDP workers sharing
 # 8 CPUs, each gets 4; leaving this unset lets PyTorch/OpenBLAS spawn 8 each,
@@ -109,13 +109,34 @@ echo "[env] CUDA   : $(python3 -c 'import torch; print(torch.version.cuda)')"
 # =============================================================================
 # 4. Path variables — edit these if you relocate the data or repo
 # =============================================================================
-REPO_DIR="$HOME/arxivlens"                 # git clone root
-SCRATCH="/scratch/$USER/mlrag"             # top-level scratch directory
+REPO_DIR="${ARXIVLENS_REPO_DIR:-$HOME/arxivlens}"
+SCRATCH="${ARXIVLENS_SCRATCH:-/scratch/$USER/mlrag}"
 
-PAIRS_FILE=$SCRATCH/corpus/pairs.jsonl     # training pairs from build_pairs
-VAL_PAIRS_FILE=$SCRATCH/corpus/val_pairs.jsonl  # held-out validation split
-CHECKPOINT_DIR=$SCRATCH/checkpoints        # .pt snapshots written here
-CONFIG=$REPO_DIR/configs/reranker.yaml     # hyperparameter config
+PAIRS_FILE="${ARXIVLENS_PAIRS_FILE:-$SCRATCH/corpus/pairs.jsonl}"
+VAL_PAIRS_FILE="${ARXIVLENS_VAL_PAIRS_FILE:-$SCRATCH/corpus/val_pairs.jsonl}"
+CHECKPOINT_DIR="${ARXIVLENS_CHECKPOINT_DIR:-$SCRATCH/checkpoints}"
+CONFIG="${ARXIVLENS_CONFIG:-$REPO_DIR/configs/reranker.yaml}"
+EVAL_INDEX_PATH="${ARXIVLENS_EVAL_INDEX_PATH:-$SCRATCH/index/index.faiss}"
+EVAL_META_PATH="${ARXIVLENS_EVAL_META_PATH:-$SCRATCH/index/meta.jsonl}"
+EVAL_PASSAGE_FORMAT="${ARXIVLENS_EVAL_PASSAGE_FORMAT:-abstract}"
+
+case "$EVAL_PASSAGE_FORMAT" in
+    abstract|title_abstract) ;;
+    *)
+        echo "[train] ERROR: ARXIVLENS_EVAL_PASSAGE_FORMAT must be abstract or title_abstract." >&2
+        exit 1
+        ;;
+esac
+
+echo "[paths] repo        : $REPO_DIR"
+echo "[paths] config      : $CONFIG"
+echo "[paths] pairs       : $PAIRS_FILE"
+echo "[paths] val pairs   : $VAL_PAIRS_FILE"
+echo "[paths] checkpoints : $CHECKPOINT_DIR"
+echo "[paths] mlflow      : $MLFLOW_TRACKING_URI"
+echo "[paths] eval index  : $EVAL_INDEX_PATH"
+echo "[paths] eval meta   : $EVAL_META_PATH"
+echo "[paths] passage fmt : $EVAL_PASSAGE_FORMAT"
 
 # =============================================================================
 # 5. Change into the repo so Python relative imports resolve correctly
@@ -127,10 +148,17 @@ cd "$REPO_DIR"
 # which is what makes `-m arxivlens.train.train_reranker` resolve.
 export PYTHONPATH="$REPO_DIR/src:${PYTHONPATH:-}"
 
+for required_file in "$CONFIG" "$PAIRS_FILE" "$EVAL_INDEX_PATH" "$EVAL_META_PATH"; do
+    if [ ! -f "$required_file" ]; then
+        echo "[train] ERROR: required file not found: $required_file" >&2
+        exit 1
+    fi
+done
+
 # =============================================================================
 # 6. Create output directories if they don't already exist
 # =============================================================================
-mkdir -p "$SCRATCH/logs" "$CHECKPOINT_DIR"
+mkdir -p "$SCRATCH/logs" "$CHECKPOINT_DIR" "$MLFLOW_TRACKING_URI"
 
 # =============================================================================
 # 7. Auto-detect resume
@@ -139,12 +167,57 @@ mkdir -p "$SCRATCH/logs" "$CHECKPOINT_DIR"
 #    --resume so the trainer reloads the latest one and continues from there.
 # =============================================================================
 RESUME_FLAG=""
+RESUME_MODE="${ARXIVLENS_RESUME:-auto}"
+HAS_CHECKPOINT=0
 if ls "$CHECKPOINT_DIR"/checkpoint_epoch*.pt 2>/dev/null | head -1 | grep -q .; then
-    RESUME_FLAG="--resume"
-    echo "[train] Resuming from existing checkpoint in $CHECKPOINT_DIR"
-else
-    echo "[train] Starting fresh training run"
+    HAS_CHECKPOINT=1
 fi
+
+case "$RESUME_MODE" in
+    auto)
+        if [ "$HAS_CHECKPOINT" -eq 1 ]; then
+            RESUME_FLAG="--resume"
+            echo "[train] Resuming from existing checkpoint in $CHECKPOINT_DIR"
+        else
+            echo "[train] Starting fresh training run"
+        fi
+        ;;
+    never)
+        if [ "$HAS_CHECKPOINT" -eq 1 ]; then
+            echo "[train] ERROR: ARXIVLENS_RESUME=never but checkpoints exist in $CHECKPOINT_DIR" >&2
+            echo "[train] Use a new checkpoint directory; existing model files are preserved." >&2
+            exit 1
+        fi
+        echo "[train] Starting fresh training run (resume disabled)"
+        ;;
+    require)
+        if [ "$HAS_CHECKPOINT" -eq 0 ]; then
+            echo "[train] ERROR: ARXIVLENS_RESUME=require but no checkpoint exists." >&2
+            exit 1
+        fi
+        RESUME_FLAG="--resume"
+        echo "[train] Resume required; loading from $CHECKPOINT_DIR"
+        ;;
+    *)
+        echo "[train] ERROR: ARXIVLENS_RESUME must be auto, never, or require." >&2
+        exit 1
+        ;;
+esac
+
+RUN_SMOKE="${ARXIVLENS_RUN_SMOKE:-1}"
+case "$RUN_SMOKE" in
+    1)
+        echo "[train] Running CPU training smoke gate ..."
+        python3 scripts/smoke_test.py
+        ;;
+    0)
+        echo "[train] Skipping smoke gate (ARXIVLENS_RUN_SMOKE=0)"
+        ;;
+    *)
+        echo "[train] ERROR: ARXIVLENS_RUN_SMOKE must be 0 or 1." >&2
+        exit 1
+        ;;
+esac
 
 # =============================================================================
 # 8. Launch distributed training via Accelerate
@@ -166,6 +239,9 @@ accelerate launch \
     --config      "$CONFIG" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
     --mlflow-dir  "$MLFLOW_TRACKING_URI" \
+    --eval-index-path "$EVAL_INDEX_PATH" \
+    --eval-meta-path "$EVAL_META_PATH" \
+    --eval-passage-format "$EVAL_PASSAGE_FORMAT" \
     $RESUME_FLAG
 
 # =============================================================================

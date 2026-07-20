@@ -10,22 +10,16 @@ This script wires together every component built in earlier phases:
         -> build PairDataset (train + optional val)
         -> Accelerator (bf16 mixed precision on A100; CPU fallback)
         -> AdamW + linear warmup then constant LR (optional cosine decay)
-        -> BCE training loop
+        -> pointwise BCE or query-group listwise training loop
         -> MLflow metric logging
         -> checkpoint save/resume
 
-Loss choice — BCEWithLogitsLoss
---------------------------------
-We use binary cross-entropy rather than a margin/pairwise ranking loss because:
-  1. Each (query, passage) pair is an *independent* binary classification task:
-     label 1 = relevant, label 0 = irrelevant.
-  2. BCE is numerically stable: ``BCEWithLogitsLoss`` fuses the sigmoid with the
-     log so there is never an explicit sigmoid followed by a log-of-small-number.
-  3. Margin ranking loss would require constructing (positive, negative) pairs
-     *within every batch*, coupling the data pipeline to batch structure. That
-     complicates the dataloader and gives no clear accuracy benefit given our
-     fixed 1:4 positive:negative ratio (from ``build_pairs``), where BCE already
-     sees four times as many negatives as positives and calibrates accordingly.
+Loss choices
+------------
+``bce`` preserves the original pointwise binary-classification objective.
+``listwise`` batches complete query groups and minimizes a softmax cross-entropy
+that raises the single gold passage above every negative in its candidate list.
+The latter matches the actual ranking task and is the recommended Sol setup.
 
 Checkpointing for Sol
 ---------------------
@@ -68,10 +62,17 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
 
-from arxivlens.data.dataset import PairDataset, collate_fn, group_split_indices
+from arxivlens.data.dataset import (
+    PairDataset,
+    QueryGroupDataset,
+    collate_fn,
+    collate_query_groups,
+    group_split_indices,
+)
 from arxivlens.model.reranker import CrossEncoderReranker
 from arxivlens.model.transformer import TransformerConfig
 from arxivlens.train.eval import build_retrieval_eval_queries, evaluate_rankings
+from arxivlens.train.losses import listwise_softmax_loss
 
 
 def _mlflow_safe(name: str) -> str:
@@ -383,6 +384,7 @@ def _run_faiss_eval(
     val_dataset: Any,
     accelerator: Accelerator,
     num_candidates: int,
+    passage_format: str = "title_abstract",
 ) -> dict[str, float]:
     """Final retrieve-then-rerank eval over the held-out queries.
 
@@ -404,7 +406,11 @@ def _run_faiss_eval(
     reranker.eval()
     try:
         queries = build_retrieval_eval_queries(
-            eval_records, retriever, reranker, num_candidates
+            eval_records,
+            retriever,
+            reranker,
+            num_candidates,
+            passage_format=passage_format,
         )
     finally:
         if was_training:
@@ -478,6 +484,26 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Override config training.n_epochs.",
     )
+    p.add_argument(
+        "--eval-index-path",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Override config training.eval_index_path.",
+    )
+    p.add_argument(
+        "--eval-meta-path",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Override config training.eval_meta_path.",
+    )
+    p.add_argument(
+        "--eval-passage-format",
+        choices=("abstract", "title_abstract"),
+        default=None,
+        help="Override config training.eval_passage_format.",
+    )
     return p
 
 
@@ -541,6 +567,26 @@ def run_training(
     # configs (and the CPU smoke test's config) working; a YAML null would
     # slip past a plain getattr, so coerce with an explicit default guard.
     eval_num_candidates: int = int(getattr(cfg.training, "eval_num_candidates", 50) or 50)
+    eval_passage_format: str = str(
+        getattr(cfg.training, "eval_passage_format", "title_abstract")
+    )
+    if eval_passage_format not in {"abstract", "title_abstract"}:
+        raise ValueError(
+            "training.eval_passage_format must be 'abstract' or "
+            f"'title_abstract', got {eval_passage_format!r}"
+        )
+    loss_type: str = str(getattr(cfg.training, "loss_type", "bce")).lower()
+    if loss_type not in {"bce", "listwise"}:
+        raise ValueError(
+            f"training.loss_type must be 'bce' or 'listwise', got {loss_type!r}"
+        )
+    queries_per_batch: int = int(getattr(cfg.training, "queries_per_batch", 4))
+    if queries_per_batch <= 0:
+        raise ValueError("training.queries_per_batch must be positive")
+    bce_aux_weight: float = float(getattr(cfg.training, "bce_aux_weight", 0.0))
+    if bce_aux_weight < 0:
+        raise ValueError("training.bce_aux_weight cannot be negative")
+    weight_decay: float = float(getattr(cfg.training, "weight_decay", 0.01))
 
     # ------------------------------------------------------------------
     # 2. Reproducibility seeds
@@ -630,14 +676,34 @@ def run_training(
     # above, which stays `seed` alone so the val split is reproducible (the
     # eval_reranker.sh mirror depends on that).
     train_gen = torch.Generator()
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,           # shuffle every epoch for better gradient diversity
-        generator=train_gen,    # reseeded per epoch -> reproducible resume
-        collate_fn=collate_fn,
-        drop_last=False,        # keep partial last batch; BCE handles any size
-    )
+    if loss_type == "listwise":
+        grouped_train_dataset = QueryGroupDataset(train_dataset)
+        n_train_groups = len(grouped_train_dataset)
+        group_sizes = grouped_train_dataset.group_sizes()
+        train_loader = DataLoader(
+            grouped_train_dataset,
+            batch_size=queries_per_batch,
+            shuffle=True,
+            generator=train_gen,
+            collate_fn=collate_query_groups,
+            # Remove a final underfilled query batch. Accelerate still shards
+            # only whole batches, so no query candidate list is ever split.
+            drop_last=n_train_groups >= queries_per_batch,
+        )
+        accelerator.print(
+            f"[data] listwise groups={n_train_groups}, "
+            f"queries_per_batch={queries_per_batch}, "
+            f"candidates/query={min(group_sizes)}..{max(group_sizes)}"
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,           # shuffle every epoch for better gradient diversity
+            generator=train_gen,    # reseeded per epoch -> reproducible resume
+            collate_fn=collate_fn,
+            drop_last=False,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
@@ -648,17 +714,17 @@ def run_training(
     accelerator.print(
         f"[data] {len(train_dataset)} train pairs, "
         f"{len(val_dataset)} val pairs, "
-        f"{len(train_loader)} train batches / epoch"
+        f"{len(train_loader)} unsharded train batches / epoch"
     )
 
     # ------------------------------------------------------------------
     # 7. Loss, optimizer, scheduler
     # ------------------------------------------------------------------
-    # BCE is appropriate because each (query, passage) pair is an independent
-    # binary classification; see module docstring for the full justification.
     criterion = nn.BCEWithLogitsLoss()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay
+    )
 
     # Two schedule shapes share the same linear warmup (0 -> lr over
     # warmup_steps):
@@ -667,7 +733,10 @@ def run_training(
     #                default numerics identical to before this option existed.
     #   "cosine"   — after warmup, cosine-decay the scale from 1 -> 0 over the
     #                remaining steps of the full run (total_steps below).
-    total_steps = n_epochs * len(train_loader)
+    # With Accelerate's default split_batches=False, DDP ranks receive
+    # different complete batches. Scheduler steps follow the per-rank length.
+    steps_per_epoch = math.ceil(len(train_loader) / accelerator.num_processes)
+    total_steps = n_epochs * steps_per_epoch
 
     def lr_lambda(step: int) -> float:
         """Return the LR scale factor at ``step`` (multiplied by base lr)."""
@@ -714,6 +783,24 @@ def run_training(
             # Load on CPU first so we don't duplicate tensors on GPU before
             # moving them; map_location='cpu' is safe with accelerate.
             state = torch.load(latest, map_location="cpu")
+            saved_training = state.get("config", {}).get("training", {})
+            saved_loss_type = str(saved_training.get("loss_type", "bce")).lower()
+            if saved_loss_type != loss_type:
+                raise RuntimeError(
+                    f"checkpoint uses loss_type={saved_loss_type!r}, but this "
+                    f"run requests {loss_type!r}; use a separate checkpoint directory"
+                )
+            if loss_type == "listwise":
+                saved_queries_per_batch = int(
+                    saved_training.get("queries_per_batch", queries_per_batch)
+                )
+                if saved_queries_per_batch != queries_per_batch:
+                    raise RuntimeError(
+                        "checkpoint uses queries_per_batch="
+                        f"{saved_queries_per_batch}, but this run requests "
+                        f"{queries_per_batch}; resume would change "
+                        "batch_in_epoch semantics"
+                    )
             # Restore model weights into the (possibly DDP-wrapped) model.
             accelerator.unwrap_model(model).load_state_dict(state["model_state_dict"])
             optimizer.load_state_dict(state["optimizer_state_dict"])
@@ -798,7 +885,15 @@ def run_training(
 
                 # Forward pass: (B,) relevance logits.
                 logits = model(batch["input_ids"], batch["attention_mask"])
-                loss = criterion(logits, batch["labels"])
+                bce_loss = criterion(logits, batch["labels"])
+                if loss_type == "listwise":
+                    ranking_loss = listwise_softmax_loss(
+                        logits, batch["labels"], batch["query_ids"]
+                    )
+                    loss = ranking_loss + bce_aux_weight * bce_loss
+                else:
+                    ranking_loss = None
+                    loss = bce_loss
 
                 # Backward through accelerator so mixed-precision scaling is
                 # handled correctly for both bf16 and fp32 modes.
@@ -821,13 +916,14 @@ def run_training(
                 if accelerator.is_main_process:
                     # Current LR is the base lr multiplied by the scheduler scale.
                     current_lr = scheduler.get_last_lr()[0]
-                    mlflow.log_metrics(
-                        {
-                            "train/loss": loss.item(),
-                            "train/lr": current_lr,
-                        },
-                        step=global_step,
-                    )
+                    train_metrics = {
+                        "train/loss": loss.item(),
+                        "train/bce_loss": bce_loss.item(),
+                        "train/lr": current_lr,
+                    }
+                    if ranking_loss is not None:
+                        train_metrics["train/listwise_loss"] = ranking_loss.item()
+                    mlflow.log_metrics(train_metrics, step=global_step)
 
                 # --- Periodic checkpoint ---
                 if global_step % checkpoint_every == 0:
@@ -926,6 +1022,7 @@ def run_training(
                         val_dataset,
                         accelerator,
                         eval_num_candidates,
+                        eval_passage_format,
                     )
                 except Exception as exc:  # noqa: BLE001 — never fail the run on eval
                     accelerator.print(
@@ -981,6 +1078,12 @@ def main() -> None:
         cfg.training.mlflow_dir = str(args.mlflow_dir)
     if args.epochs is not None:
         cfg.training.n_epochs = args.epochs
+    if args.eval_index_path is not None:
+        cfg.training.eval_index_path = str(args.eval_index_path)
+    if args.eval_meta_path is not None:
+        cfg.training.eval_meta_path = str(args.eval_meta_path)
+    if args.eval_passage_format is not None:
+        cfg.training.eval_passage_format = args.eval_passage_format
 
     # ------------------------------------------------------------------
     # 2. Accelerator — bf16 on A100, silent fallback to fp32 elsewhere
@@ -1000,12 +1103,15 @@ def main() -> None:
     accelerator.print(f"[tokenizer] loading {tokenizer_name} ...")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
+    # Store resolved CLI overrides so checkpoint provenance describes the
+    # actual paths and hyperparameters used by this run.
+    resolved_cfg_dict = cfg.as_dict_nested()
     run_training(
         cfg,
         tokenizer,
         accelerator=accelerator,
         resume=args.resume,
-        cfg_dict=cfg_dict,
+        cfg_dict=resolved_cfg_dict,
     )
 
 

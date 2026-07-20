@@ -95,8 +95,8 @@ echo "[env] PyTorch: $(python3 -c 'import torch; print(torch.__version__)')"
 # =============================================================================
 # 4. Path variables
 # =============================================================================
-REPO_DIR="$HOME/arxivlens"
-SCRATCH="/scratch/$USER/mlrag"
+REPO_DIR="${ARXIVLENS_REPO_DIR:-$HOME/arxivlens}"
+SCRATCH="${ARXIVLENS_SCRATCH:-/scratch/$USER/mlrag}"
 
 # Two candidate pair sources:
 #   VAL_PAIRS_FILE — an explicit held-out split, if one was ever emitted.
@@ -104,9 +104,9 @@ SCRATCH="/scratch/$USER/mlrag"
 #                    auto-splits the same held-out fraction the trainer uses.
 # Nothing in the project is guaranteed to create val_pairs.jsonl, so we hand
 # both paths to Python and let it decide (mirroring train_reranker.py's logic).
-VAL_PAIRS_FILE=$SCRATCH/corpus/val_pairs.jsonl
-PAIRS_FILE=$SCRATCH/corpus/pairs.jsonl
-CHECKPOINT_DIR=$SCRATCH/checkpoints
+VAL_PAIRS_FILE="${ARXIVLENS_VAL_PAIRS_FILE:-$SCRATCH/corpus/val_pairs.jsonl}"
+PAIRS_FILE="${ARXIVLENS_PAIRS_FILE:-$SCRATCH/corpus/pairs.jsonl}"
+CHECKPOINT_DIR="${ARXIVLENS_CHECKPOINT_DIR:-$SCRATCH/checkpoints}"
 
 # Retrieve-then-rerank eval config.
 #   EVAL_NUM_CANDIDATES — candidates the FAISS retriever surfaces per query
@@ -121,6 +121,15 @@ CHECKPOINT_DIR=$SCRATCH/checkpoints
 EVAL_NUM_CANDIDATES="${EVAL_NUM_CANDIDATES:-50}"
 EVAL_INDEX_PATH="${EVAL_INDEX_PATH:-$SCRATCH/index/index.faiss}"
 EVAL_META_PATH="${EVAL_META_PATH:-$SCRATCH/index/meta.jsonl}"
+EVAL_PASSAGE_FORMAT="${EVAL_PASSAGE_FORMAT:-checkpoint}"
+
+case "$EVAL_PASSAGE_FORMAT" in
+    checkpoint|abstract|title_abstract) ;;
+    *)
+        echo "[eval] ERROR: EVAL_PASSAGE_FORMAT must be checkpoint, abstract, or title_abstract." >&2
+        exit 1
+        ;;
+esac
 
 # Durable provenance artifact directory. The Python heredoc writes one JSON per
 # job here (results/eval_<SLURM_JOB_ID>.json) recording exactly which run/
@@ -159,6 +168,7 @@ export EVAL_NUM_CANDIDATES
 export EVAL_INDEX_PATH
 export EVAL_META_PATH
 export EVAL_RESULTS_DIR
+export EVAL_PASSAGE_FORMAT
 
 # =============================================================================
 # 5. Change into the repo (keeps relative imports consistent with training)
@@ -179,10 +189,14 @@ export PYTHONPATH="$REPO_DIR/src:${PYTHONPATH:-}"
 #    the same second (mtime then falls back to the zero-padded name, which is
 #    still correct).
 # =============================================================================
-LATEST_CKPT=$(ls -t "$CHECKPOINT_DIR"/checkpoint_epoch*.pt 2>/dev/null | head -1 || true)
+if [ -n "${EVAL_CHECKPOINT:-}" ]; then
+    LATEST_CKPT="$EVAL_CHECKPOINT"
+else
+    LATEST_CKPT=$(ls -t "$CHECKPOINT_DIR"/checkpoint_epoch*.pt 2>/dev/null | head -1 || true)
+fi
 
-if [ -z "$LATEST_CKPT" ]; then
-    echo "[eval] ERROR: No checkpoint found in $CHECKPOINT_DIR. Train first." >&2
+if [ -z "$LATEST_CKPT" ] || [ ! -f "$LATEST_CKPT" ]; then
+    echo "[eval] ERROR: checkpoint not found: ${LATEST_CKPT:-<none>}" >&2
     exit 1
 fi
 
@@ -225,6 +239,7 @@ train_pairs = os.environ.get("PAIRS_FILE", "")
 num_candidates = int(os.environ["EVAL_NUM_CANDIDATES"])
 index_path = os.environ["EVAL_INDEX_PATH"]
 meta_path = os.environ["EVAL_META_PATH"]
+requested_passage_format = os.environ["EVAL_PASSAGE_FORMAT"]
 
 print(f"[eval] Loading checkpoint: {ckpt_path}")
 
@@ -234,6 +249,11 @@ print(f"[eval] Loading checkpoint: {ckpt_path}")
 # so the state dict is plain module weights without DDP prefixes.
 state = torch.load(ckpt_path, map_location="cpu")
 cfg = state["config"]
+passage_format = requested_passage_format
+if passage_format == "checkpoint":
+    passage_format = str(
+        cfg.get("training", {}).get("eval_passage_format", "title_abstract")
+    )
 
 # val_fraction / seed are read from the checkpoint config so the auto-split
 # held-out set below matches the trainer's actual val split exactly, falling
@@ -386,12 +406,14 @@ retriever = FaissRetriever(index_path=index_path, meta_path=meta_path)
 # candidates from FAISS, rerank them with the cross-encoder, and label the
 # query's own paper as the single positive. This is the desaturated protocol.
 print(f"[eval] Retrieving {num_candidates} candidates/query and reranking ...")
+print(f"[eval] Passage format: {passage_format}")
 reranker_queries, retrieval_queries = build_retrieval_eval_queries(
     eval_records=eval_records,
     retriever=retriever,
     reranker=model,
     num_candidates=num_candidates,
     with_retrieval_baseline=True,
+    passage_format=passage_format,
 )
 
 # Reranker metrics (existing var name kept) plus a retrieval-only baseline over
@@ -417,6 +439,7 @@ print(f"Checkpoint          : {ckpt_path}")
 print(f"Eval source         : {eval_source}")
 print(f"Index / meta        : {index_path} | {meta_path}")
 print(f"Candidates/query    : {num_candidates}")
+print(f"Passage format      : {passage_format}")
 print(f"N queries           : {n_scored}")
 print(f"Gold missed retrieval: {n_missed}  (retriever recall ceiling)")
 print(
@@ -445,6 +468,7 @@ report = {
     "index_path": index_path,
     "meta_path": meta_path,
     "num_candidates": num_candidates,
+    "passage_format": passage_format,
     "n_queries": n_scored,
     "gold_missed_retrieval": n_missed,
     "skipped_positional_id": n_skipped_positional,

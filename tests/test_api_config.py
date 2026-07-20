@@ -77,10 +77,11 @@ class _FakeRetriever:
 class _FakeRetrieveReranker:
     """Stores the collaborators it is handed so the test can inspect them."""
 
-    def __init__(self, retriever, reranker, retrieve_k):
+    def __init__(self, retriever, reranker, retrieve_k, passage_format):
         self.retriever = retriever
         self.reranker = reranker
         self.retrieve_k = retrieve_k
+        self.passage_format = passage_format
 
 
 def _write_tiny_checkpoint(path) -> None:
@@ -105,7 +106,10 @@ def _write_tiny_checkpoint(path) -> None:
     )
     reranker = CrossEncoderReranker(config)
     state = {
-        "config": {"model": dict(TINY_MODEL_CFG)},
+        "config": {
+            "model": dict(TINY_MODEL_CFG),
+            "training": {"eval_passage_format": "abstract"},
+        },
         "model_state_dict": reranker.state_dict(),
     }
     torch.save(state, str(path))
@@ -187,6 +191,7 @@ def test_get_pipeline_loads_checkpoint_config(wired_env):
         "arxivlens.model.reranker", fromlist=["CrossEncoderReranker"]
     ).CrossEncoderReranker)
     assert pipeline.retrieve_k == 7
+    assert pipeline.passage_format == "abstract"
 
 
 def test_get_pipeline_reranker_is_eval_mode(wired_env):

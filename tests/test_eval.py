@@ -371,6 +371,37 @@ def test_build_retrieval_eval_passages_use_candidate_text_not_query():
     assert reranker.seen_queries[0] == "gold-query"  # query text is the title
 
 
+def test_build_retrieval_eval_supports_abstract_only_passages():
+    cands = [
+        _candidate("P0", "gold", abstract="gold-abs"),
+        _candidate("N0", "neg0", abstract="neg-abs"),
+    ]
+    retriever = _FakeRetriever({"gold-query": cands})
+    reranker = _FakeReranker({})
+    records = [{"id": "P0", "title": "gold-query", "abstract": "query-abs"}]
+
+    build_retrieval_eval_queries(
+        records,
+        retriever,
+        reranker,
+        num_candidates=50,
+        passage_format="abstract",
+    )
+
+    assert reranker.seen_passages[0] == ["gold-abs", "neg-abs"]
+
+
+def test_build_retrieval_eval_rejects_unknown_passage_format():
+    with pytest.raises(ValueError, match="passage_format"):
+        build_retrieval_eval_queries(
+            [],
+            _FakeRetriever({}),
+            _FakeReranker({}),
+            num_candidates=50,
+            passage_format="unknown",
+        )
+
+
 def test_build_retrieval_eval_normalizes_ids():
     # Retrieved paper_id has surrounding whitespace; record id is clean.
     cands = [_candidate("  P0  ", "gold")]

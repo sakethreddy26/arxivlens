@@ -54,6 +54,19 @@ class StubReranker:
         return score, attn_info
 
 
+class RecordingReranker(StubReranker):
+    def __init__(self):
+        self.passages = []
+
+    def score(self, query, passages):
+        self.passages.append(list(passages))
+        return super().score(query, passages)
+
+    def score_with_attention(self, query, passage):
+        self.passages.append([passage])
+        return super().score_with_attention(query, passage)
+
+
 # --------------------------------------------------------------------------- #
 # Fixtures                                                                     #
 # --------------------------------------------------------------------------- #
@@ -129,6 +142,31 @@ def test_search_fewer_than_top_n(stub_pipeline):
     # retrieve_k=5, top_n=10: only 5 candidates exist, so 5 must be returned.
     results = stub_pipeline.search("transformers", top_n=10)
     assert len(results) == 5
+
+
+def test_abstract_passage_format_is_used_for_search_and_explain():
+    reranker = RecordingReranker()
+    pipeline = RetrieveReranker(
+        retriever=StubRetriever(),
+        reranker=reranker,
+        retrieve_k=5,
+        passage_format="abstract",
+    )
+
+    pipeline.search("transformers", top_n=1)
+    pipeline.explain("transformers", "p1")
+
+    assert reranker.passages[0] == [c["abstract"] for c in STUB_CANDIDATES]
+    assert reranker.passages[1] == [STUB_CANDIDATES[0]["abstract"]]
+
+
+def test_unknown_passage_format_is_rejected():
+    with pytest.raises(ValueError, match="passage_format"):
+        RetrieveReranker(
+            retriever=StubRetriever(),
+            reranker=StubReranker(),
+            passage_format="unknown",
+        )
 
 
 def test_explain_returns_explain_info(stub_pipeline):

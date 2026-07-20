@@ -2,7 +2,7 @@
 
 This is the end-to-end GATE for the training code: it drives the REAL
 ``run_training`` entry point (the same function ``main`` calls) on a tiny
-CPU-only config with an offline stub tokenizer, and asserts five properties
+CPU-only config with an offline stub tokenizer, and asserts six properties
 that together prove the loop, checkpointing, resume (mid-epoch AND
 epoch-boundary), and eval are all wired correctly:
 
@@ -16,6 +16,8 @@ epoch-boundary), and eval are all wired correctly:
     (e) epoch-boundary resume -- resuming from an epoch-END checkpoint
         (batch_in_epoch == 0) starts the NEXT epoch and never silently
         retrains the completed one.
+    (f) listwise mode -- complete query groups train end-to-end, produce finite
+        losses, and save the requested ranking objective in checkpoint provenance.
 
 No network, no GPU, no HuggingFace download: the tokenizer is the deterministic
 ``StubTokenizer`` from ``tests/test_dataset.py`` and everything runs in a temp
@@ -376,10 +378,51 @@ def main() -> int:
             f"(exact_advance={step_ok})",
         ))
 
+        # ---------------------------------------------------------------- #
+        # (f) Ranking-aligned listwise mode: this is the objective used by
+        # the improved Sol experiment. Exercise the real grouped dataloader,
+        # loss, optimizer, checkpoint, and eval path before an A100 job starts.
+        # ---------------------------------------------------------------- #
+        listwise_dir = tmp / "listwise_ckpts"
+        cfg_l = _make_cfg(tmp, pairs_file, vocab_size, n_epochs=1)
+        cfg_l.training.checkpoint_dir = str(listwise_dir)
+        cfg_l.training.loss_type = "listwise"
+        cfg_l.training.queries_per_batch = 2
+        cfg_l.training.bce_aux_weight = 0.1
+        cfg_l.training.weight_decay = 0.01
+        log_l = run_training(cfg_l, tokenizer, accelerator=None, resume=False)
+
+        listwise_ckpt = _load_latest_checkpoint(listwise_dir)
+        listwise_state = (
+            torch.load(listwise_ckpt, map_location="cpu") if listwise_ckpt else {}
+        )
+        listwise_losses = log_l["step_losses"]
+        finite_losses = bool(listwise_losses) and all(
+            torch.isfinite(torch.tensor(value)).item() for value in listwise_losses
+        )
+        saved_loss_type = (
+            listwise_state.get("config", {})
+            .get("training", {})
+            .get("loss_type")
+        )
+        ok_f = (
+            finite_losses
+            and listwise_ckpt is not None
+            and saved_loss_type == "listwise"
+            and int(log_l["global_step"]) > 0
+        )
+        results.append(_report(
+            "(f) listwise training path",
+            ok_f,
+            f"steps={log_l['global_step']}, finite_losses={finite_losses}, "
+            f"checkpoint={listwise_ckpt.name if listwise_ckpt else '<none>'}, "
+            f"saved_loss_type={saved_loss_type!r}",
+        ))
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    passed = all(results) and len(results) == 5
+    passed = all(results) and len(results) == 6
     print()
     print("SMOKE TEST PASSED" if passed else "SMOKE TEST FAILED")
     return 0 if passed else 1

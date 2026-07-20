@@ -92,6 +92,8 @@ class RetrieveReranker:
                      .score(query, passages) -> Tensor and
                      .score_with_attention(query, passage) -> (score, attention_info))
         retrieve_k:  number of candidates to pull from the retriever before reranking
+        passage_format: candidate text passed to the reranker: ``abstract`` or
+                        ``title_abstract``
     """
 
     def __init__(
@@ -99,10 +101,24 @@ class RetrieveReranker:
         retriever: RetrieverLike,
         reranker: RerankerLike,
         retrieve_k: int = 50,
+        passage_format: str = "title_abstract",
     ) -> None:
+        if passage_format not in {"abstract", "title_abstract"}:
+            raise ValueError(
+                "passage_format must be 'abstract' or 'title_abstract', "
+                f"got {passage_format!r}"
+            )
         self.retriever = retriever
         self.reranker = reranker
         self.retrieve_k = retrieve_k
+        self.passage_format = passage_format
+
+    def _passage(self, candidate: dict[str, Any]) -> str:
+        abstract = str(candidate.get("abstract") or "")
+        if self.passage_format == "abstract":
+            return abstract.strip()
+        title = str(candidate.get("title") or "")
+        return f"{title} {abstract}".strip()
 
     def search(self, query: str, top_n: int = 10) -> list[RankedResult]:
         """Full pipeline: retrieve then rerank, return top_n results.
@@ -123,7 +139,7 @@ class RetrieveReranker:
         if not candidates:
             return []
 
-        passages = [f"{c['title']} {c['abstract']}".strip() for c in candidates]
+        passages = [self._passage(candidate) for candidate in candidates]
         scores = self.reranker.score(query, passages)  # Tensor (n_candidates,)
         scores_list = scores.cpu().tolist()
 
@@ -171,7 +187,7 @@ class RetrieveReranker:
                 f"paper_id {paper_id!r} not found in top-{self.retrieve_k} candidates"
             )
 
-        passage = f"{target['title']} {target['abstract']}".strip()
+        passage = self._passage(target)
         score, attn_info = self.reranker.score_with_attention(query, passage)
 
         # qp_attn shape: (n_layers, n_heads, q_tokens, p_tokens) or None.

@@ -94,9 +94,13 @@ def get_pipeline() -> Any:
     # stored *inside* the checkpoint is authoritative (it is the arch the weights
     # were trained with) — mirrors slurm/eval_reranker.sh so shapes always match.
     checkpoint = os.environ.get("CHECKPOINT")
+    passage_format = "title_abstract"
     if checkpoint:
         state = torch.load(checkpoint, map_location="cpu")
         cfg = state["config"]
+        passage_format = str(
+            cfg.get("training", {}).get("eval_passage_format", passage_format)
+        )
         m = cfg["model"]
         config = TransformerConfig(
             vocab_size=m["vocab_size"],
@@ -125,7 +129,13 @@ def get_pipeline() -> Any:
         reranker = CrossEncoderReranker(config, tokenizer=tokenizer)
 
     retrieve_k = int(os.environ.get("RETRIEVE_K", "50"))
-    return RetrieveReranker(retriever=retriever, reranker=reranker, retrieve_k=retrieve_k)
+    passage_format = os.environ.get("PASSAGE_FORMAT", passage_format)
+    return RetrieveReranker(
+        retriever=retriever,
+        reranker=reranker,
+        retrieve_k=retrieve_k,
+        passage_format=passage_format,
+    )
 
 
 app = FastAPI(

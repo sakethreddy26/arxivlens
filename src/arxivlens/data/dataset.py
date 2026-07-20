@@ -48,7 +48,7 @@ from typing import Any, Sequence
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 
 
 def group_split_indices(
@@ -172,6 +172,10 @@ class PairDataset(Dataset):
             for i, line in enumerate(self._lines)
         ]
 
+    def labels(self) -> list[int]:
+        """Return binary labels in dataset order without tokenizing examples."""
+        return [int(json.loads(line)["label"]) for line in self._lines]
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """Tokenize the pair at ``idx`` and return tensors.
 
@@ -265,3 +269,65 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "labels": labels,
         "query_ids": query_ids,
     }
+
+
+def _metadata_for_dataset(dataset: Dataset) -> tuple[list[str], list[int]]:
+    """Return query ids and labels for a PairDataset or one of its Subsets."""
+    if isinstance(dataset, Subset):
+        query_ids, labels = _metadata_for_dataset(dataset.dataset)
+        indices = [int(index) for index in dataset.indices]
+        return [query_ids[i] for i in indices], [labels[i] for i in indices]
+    if not isinstance(dataset, PairDataset):
+        raise TypeError(
+            "QueryGroupDataset requires PairDataset or Subset[PairDataset], "
+            f"got {type(dataset).__name__}"
+        )
+    return dataset.query_ids(), dataset.labels()
+
+
+class QueryGroupDataset(Dataset):
+    """Expose one complete query/candidate group as each dataset item.
+
+    A listwise loss is only valid when every candidate for a query is present
+    together. Wrapping PairDataset at the dataset-item level lets a normal
+    PyTorch/Accelerate batch sampler shard whole query groups across DDP ranks;
+    no rank ever receives half of a ranking.
+    """
+
+    def __init__(self, dataset: Dataset) -> None:
+        self._dataset = dataset
+        query_ids, labels = _metadata_for_dataset(dataset)
+        groups: dict[str, list[int]] = {}
+        for index, query_id in enumerate(query_ids):
+            groups.setdefault(query_id, []).append(index)
+
+        if not groups:
+            raise ValueError("listwise training dataset contains no query groups")
+        for query_id, indices in groups.items():
+            positives = sum(labels[index] == 1 for index in indices)
+            if positives != 1:
+                raise ValueError(
+                    f"query group {query_id!r} has {positives} positives; "
+                    "listwise training requires exactly one"
+                )
+            if len(indices) < 2:
+                raise ValueError(
+                    f"query group {query_id!r} has no negative candidates"
+                )
+        self._groups = list(groups.items())
+
+    def __len__(self) -> int:
+        return len(self._groups)
+
+    def __getitem__(self, index: int) -> list[dict[str, Any]]:
+        _query_id, pair_indices = self._groups[index]
+        return [self._dataset[pair_index] for pair_index in pair_indices]
+
+    def group_sizes(self) -> list[int]:
+        """Candidate count per query group, useful for run diagnostics."""
+        return [len(indices) for _query_id, indices in self._groups]
+
+
+def collate_query_groups(groups: list[list[dict[str, Any]]]) -> dict[str, Any]:
+    """Flatten complete query groups, then apply the standard pair collation."""
+    return collate_fn([item for group in groups for item in group])

@@ -285,6 +285,20 @@ def _looks_like_positional_index(value: str) -> bool:
     return value.isdigit()
 
 
+def _candidate_passage(candidate: Mapping[str, Any], passage_format: str) -> str:
+    """Build candidate text using an explicit, validated evaluation format."""
+    abstract = "" if candidate.get("abstract") is None else str(candidate["abstract"])
+    if passage_format == "abstract":
+        return abstract.strip()
+    if passage_format == "title_abstract":
+        title = "" if candidate.get("title") is None else str(candidate["title"])
+        return f"{title} {abstract}".strip()
+    raise ValueError(
+        "passage_format must be 'abstract' or 'title_abstract', "
+        f"got {passage_format!r}"
+    )
+
+
 def build_retrieval_eval_queries(
     eval_records: Iterable[Mapping[str, Any]],
     retriever: Any,
@@ -292,6 +306,7 @@ def build_retrieval_eval_queries(
     num_candidates: int,
     *,
     with_retrieval_baseline: bool = False,
+    passage_format: str = "title_abstract",
 ) -> (
     list[tuple[list[float], list[float]]]
     | tuple[
@@ -351,6 +366,9 @@ def build_retrieval_eval_queries(
             ``True`` a retrieval-only baseline is emitted alongside the reranker
             queries so the two can be compared head-to-head over the IDENTICAL
             held-out queries and candidate sets.
+        passage_format: ``"title_abstract"`` mirrors the original serving
+            pipeline. ``"abstract"`` matches the current synthetic training
+            pairs and is the recommended format for the listwise Sol run.
 
     Returns:
         When ``with_retrieval_baseline`` is ``False``: one ``(scores, labels)``
@@ -372,12 +390,17 @@ def build_retrieval_eval_queries(
             rather than a real paper id (its real id was lost during
             reconstruction, making label matching meaningless).
     """
+    if passage_format not in {"abstract", "title_abstract"}:
+        raise ValueError(
+            "passage_format must be 'abstract' or 'title_abstract', "
+            f"got {passage_format!r}"
+        )
+
     out: list[tuple[list[float], list[float]]] = []
     retrieval_out: list[tuple[list[float], list[float]]] = []
 
     for record in eval_records:
         title = "" if record.get("title") is None else str(record["title"])
-        abstract = "" if record.get("abstract") is None else str(record["abstract"])
         gold_id = _normalize_id(record.get("id", ""))
 
         if not gold_id or _looks_like_positional_index(gold_id):
@@ -395,14 +418,11 @@ def build_retrieval_eval_queries(
             retrieval_out.append(([], []))
             continue
 
-        # Passage text mirrors retrieve/pipeline.py: each candidate's OWN
-        # title+abstract, not the query's. This "{title} {abstract}" format
-        # INTENTIONALLY differs from training (which uses abstract-only passages):
-        # eval mirrors retrieve/pipeline.py / production so we "evaluate as
-        # deployed". Do NOT "fix" this to abstract-only — that would break
-        # parity with the production pipeline.
+        # Use each candidate's own text. The explicit format lets one run the
+        # deployed title+abstract path and the training-aligned abstract path
+        # without changing candidate sets or labels.
         passages = [
-            f"{c.get('title', '')} {c.get('abstract', '')}".strip() for c in candidates
+            _candidate_passage(candidate, passage_format) for candidate in candidates
         ]
         scores = reranker.score(query=title, passages=passages)
 
